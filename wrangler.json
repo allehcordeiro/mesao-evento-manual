@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "mesao-evento",
+  "compatibility_date": "2026-07-18",
+  "main": "worker/index.ts",
+  "assets": {
+    "not_found_handling": "single-page-application"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mesao-evento-db",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "vars": {
+    "APP_NAME": "Mesão Evento"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

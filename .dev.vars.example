@@ -1,0 +1,2 @@
+APP_PIN=1234
+SESSION_SECRET=segredo-local-apenas-para-desenvolvimento
