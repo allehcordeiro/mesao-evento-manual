@@ -488,6 +488,7 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
 
   return (
     <div className="drawer-scroll card-order-flow">
+      <div className="card-flow-version" role="status">Leitura individual · versão 2</div>
       {error && <div className="inline-error">{error}</div>}
 
       <section className="card-step">
