@@ -19,3 +19,8 @@ npm run dev
 ```
 
 PIN local: `1234`.
+
+
+## Cartas avulsas
+
+Antes de publicar a versão com cartas, execute `npm run db:remote` para aplicar `migrations/0002_card_orders.sql`. Veja **CARTAS-AVULSAS.md**.

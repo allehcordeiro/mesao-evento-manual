@@ -254,6 +254,11 @@ export default function App() {
               "Pagamento registrado."
             )
           }
+          onCardOrderCompleted={(updated) => {
+            setSelectedTab(updated);
+            loadData();
+            notify("Cartas adicionadas à comanda.");
+          }}
           onCloseTab={() =>
             mutateTab(async () => {
               const updated = await closeTab(selectedTab.id);

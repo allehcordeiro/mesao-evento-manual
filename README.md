@@ -15,10 +15,11 @@ Aplicativo mobile/PWA para operação dos eventos do **Mesão do Amor**.
 - pagamentos
 - fila de preparo
 - carga inicial de produtos da planilha atual
+- venda mobile de cartas avulsas com OCR opcional, Scryfall e LigaMagic
 
 ## Comece por aqui
 
-Leia o arquivo **CONFIGURAR-CLOUDFLARE.md**. Ele explica a configuração manual do D1, do Worker, dos segredos e da publicação pelo GitHub.
+Leia o arquivo **CONFIGURAR-CLOUDFLARE.md**. Para o novo fluxo de cartas, consulte também **CARTAS-AVULSAS.md**. Ele explica a configuração manual do D1, do Worker, dos segredos e da publicação pelo GitHub.
 
 ## Teste local
 
@@ -37,6 +38,7 @@ npm run dev
 
 - `wrangler.json`: configuração do Worker e vínculo com o D1.
 - `database/schema.sql`: criação das tabelas e carga inicial.
-- `migrations/0001_initial.sql`: mesma estrutura em formato de migration.
+- `migrations/0001_initial.sql`: estrutura inicial.
+- `migrations/0002_card_orders.sql`: fluxo de cartas avulsas.
 - `worker/index.ts`: API e regras de negócio.
 - `src/`: interface do aplicativo.

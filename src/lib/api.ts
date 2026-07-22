@@ -1,5 +1,9 @@
 import type {
   BootstrapData,
+  CardFolder,
+  CardOrderDetail,
+  CardOrderItemInput,
+  ScryfallCardOption,
   EventInfo,
   KitchenItem,
   Person,
@@ -149,4 +153,46 @@ export async function updateEvent(
     method: "PATCH",
     body: JSON.stringify(input)
   });
+}
+
+
+export async function listCardFolders(): Promise<CardFolder[]> {
+  return request<CardFolder[]>("/api/card-folders");
+}
+
+export async function createCardFolder(name: string): Promise<CardFolder> {
+  return request<CardFolder>("/api/card-folders", {
+    method: "POST",
+    body: JSON.stringify({ name })
+  });
+}
+
+export async function resolveScryfallCard(query: string): Promise<ScryfallCardOption> {
+  return request<ScryfallCardOption>(
+    `/api/cards/scryfall/named?q=${encodeURIComponent(query)}`
+  );
+}
+
+export async function listScryfallPrints(name: string): Promise<ScryfallCardOption[]> {
+  return request<ScryfallCardOption[]>(
+    `/api/cards/scryfall/prints?name=${encodeURIComponent(name)}`
+  );
+}
+
+export async function createCardOrder(
+  tabId: string,
+  input: {
+    folderId: string;
+    photoDataUrl?: string | null;
+    items: CardOrderItemInput[];
+  }
+): Promise<TabDetail> {
+  return request<TabDetail>(`/api/tabs/${tabId}/card-orders`, {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
+export async function getCardOrder(cardOrderId: string): Promise<CardOrderDetail> {
+  return request<CardOrderDetail>(`/api/card-orders/${cardOrderId}`);
 }
