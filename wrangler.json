@@ -15,6 +15,7 @@
   ],
   "vars": {
     "APP_NAME": "Mesão Evento"
+    
   },
   "observability": {
     "enabled": true
