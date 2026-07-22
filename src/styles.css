@@ -1728,3 +1728,76 @@ small {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
+
+/* Fluxo sequencial de leitura: uma carta por fotografia. */
+.photo-picker--single {
+  min-height: 290px;
+}
+
+.card-draft--current {
+  grid-template-columns: 72px minmax(0, 1fr);
+}
+
+.card-draft--current .card-thumb {
+  width: 72px;
+}
+
+.confirmed-card-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.confirmed-card {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.62rem;
+  padding: 0.58rem;
+  border: 1px solid var(--line);
+  border-radius: 0.9rem;
+  background: white;
+}
+
+.confirmed-card > img,
+.confirmed-card__empty {
+  width: 42px;
+  aspect-ratio: 63 / 88;
+  border-radius: 0.38rem;
+  object-fit: cover;
+  background: #eee8de;
+}
+
+.confirmed-card__empty {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.confirmed-card > div:nth-child(2) {
+  min-width: 0;
+  display: grid;
+  gap: 0.12rem;
+}
+
+.confirmed-card strong,
+.confirmed-card small,
+.confirmed-card span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.confirmed-card strong {
+  font-size: 0.78rem;
+}
+
+.confirmed-card small {
+  color: var(--muted);
+  font-size: 0.65rem;
+}
+
+.confirmed-card span {
+  color: var(--green-900);
+  font-size: 0.72rem;
+  font-weight: 850;
+}

@@ -58,6 +58,7 @@ interface DraftCard {
   priceText: string;
   searching: boolean;
   error: string;
+  photoDataUrl: string | null;
 }
 
 interface CardOrderFlowProps {
@@ -86,11 +87,13 @@ function createDraftCard(index: number): DraftCard {
     condition: "NM",
     priceText: "",
     searching: false,
-    error: ""
+    error: "",
+    photoDataUrl: null
   };
 }
 
 function parseMoneyToCents(value: string): number {
+  if (!/\d/.test(value)) return -1;
   const normalized = value.replace(/\./g, "").replace(",", ".");
   const amount = Number(normalized);
   return Number.isFinite(amount) ? Math.round(amount * 100) : -1;
@@ -120,7 +123,7 @@ async function compressPhoto(file: File): Promise<string> {
     const image = await loadImage(sourceUrl);
     const maxSide = 1400;
     let scale = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight));
-    let quality = 0.82;
+    let quality = 0.84;
     let result = "";
 
     for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -131,12 +134,12 @@ async function compressPhoto(file: File): Promise<string> {
       if (!context) throw new Error("Seu navegador não conseguiu preparar a fotografia.");
       context.drawImage(image, 0, 0, canvas.width, canvas.height);
       result = canvas.toDataURL("image/jpeg", quality);
-      if (result.length <= 780_000) return result;
+      if (result.length <= 700_000) return result;
       quality = Math.max(0.48, quality - 0.08);
       if (attempt >= 4) scale *= 0.88;
     }
 
-    if (result.length > 880_000) {
+    if (result.length > 780_000) {
       throw new Error("A fotografia ficou muito grande. Afaste um pouco a câmera e tente novamente.");
     }
     return result;
@@ -145,37 +148,23 @@ async function compressPhoto(file: File): Promise<string> {
   }
 }
 
-function gridColumns(cardCount: number): number {
-  if (cardCount <= 2) return cardCount;
-  if (cardCount <= 6) return 3;
-  return 4;
-}
-
-async function cropCardTitle(
-  photoDataUrl: string,
-  cardIndex: number,
-  cardCount: number
-): Promise<string> {
+async function cropSingleCardTitle(photoDataUrl: string): Promise<string> {
   const image = await loadImage(photoDataUrl);
-  const columns = gridColumns(cardCount);
-  const rows = Math.ceil(cardCount / columns);
-  const column = cardIndex % columns;
-  const row = Math.floor(cardIndex / columns);
-  const cellWidth = image.naturalWidth / columns;
-  const cellHeight = image.naturalHeight / rows;
 
-  // A faixa superior contém o nome. Pequena margem evita ler cartas vizinhas.
-  const sourceX = column * cellWidth + cellWidth * 0.04;
-  const sourceY = row * cellHeight + cellHeight * 0.02;
-  const sourceWidth = cellWidth * 0.92;
-  const sourceHeight = cellHeight * 0.24;
+  // Como a captura é de uma única carta, a faixa superior pode ser ampliada
+  // agressivamente sem risco de misturar cartas vizinhas.
+  const sourceX = image.naturalWidth * 0.035;
+  const sourceY = image.naturalHeight * 0.025;
+  const sourceWidth = image.naturalWidth * 0.93;
+  const sourceHeight = image.naturalHeight * 0.22;
 
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(600, Math.round(sourceWidth * 1.8));
-  canvas.height = Math.max(120, Math.round(sourceHeight * 1.8));
+  canvas.width = Math.max(900, Math.round(sourceWidth * 2.2));
+  canvas.height = Math.max(180, Math.round(sourceHeight * 2.2));
   const context = canvas.getContext("2d");
   if (!context) throw new Error("Não foi possível recortar a fotografia.");
-  context.filter = "grayscale(1) contrast(1.35)";
+
+  context.filter = "grayscale(1) contrast(1.65) brightness(1.08)";
   context.drawImage(
     image,
     sourceX,
@@ -187,7 +176,8 @@ async function cropCardTitle(
     canvas.width,
     canvas.height
   );
-  return canvas.toDataURL("image/jpeg", 0.9);
+
+  return canvas.toDataURL("image/jpeg", 0.92);
 }
 
 function cleanOcrName(text: string): string {
@@ -199,15 +189,54 @@ function cleanOcrName(text: string): string {
   return lines.sort((left, right) => right.length - left.length)[0]?.slice(0, 80) ?? "";
 }
 
+async function composeOrderPhoto(cards: DraftCard[]): Promise<string | null> {
+  const photos = cards.map((card) => card.photoDataUrl).filter((value): value is string => Boolean(value));
+  if (photos.length === 0) return null;
+  if (photos.length === 1) return photos[0];
+
+  const images = await Promise.all(photos.map(loadImage));
+  const columns = Math.min(3, images.length);
+  const rows = Math.ceil(images.length / columns);
+  const cellWidth = columns === 1 ? 540 : 300;
+  const cellHeight = Math.round(cellWidth * 1.4);
+  const canvas = document.createElement("canvas");
+  canvas.width = columns * cellWidth;
+  canvas.height = rows * cellHeight;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Não foi possível montar o registro fotográfico do lote.");
+
+  context.fillStyle = "#f4efe5";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  images.forEach((image, index) => {
+    const column = index % columns;
+    const row = Math.floor(index / columns);
+    const padding = 10;
+    const areaWidth = cellWidth - padding * 2;
+    const areaHeight = cellHeight - padding * 2;
+    const scale = Math.min(areaWidth / image.naturalWidth, areaHeight / image.naturalHeight);
+    const drawWidth = image.naturalWidth * scale;
+    const drawHeight = image.naturalHeight * scale;
+    const x = column * cellWidth + (cellWidth - drawWidth) / 2;
+    const y = row * cellHeight + (cellHeight - drawHeight) / 2;
+    context.drawImage(image, x, y, drawWidth, drawHeight);
+  });
+
+  let quality = 0.82;
+  let result = canvas.toDataURL("image/jpeg", quality);
+  while (result.length > 760_000 && quality > 0.44) {
+    quality -= 0.08;
+    result = canvas.toDataURL("image/jpeg", quality);
+  }
+  return result;
+}
+
 export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) {
   const [folders, setFolders] = useState<CardFolder[]>([]);
   const [folderId, setFolderId] = useState("");
   const [newFolderName, setNewFolderName] = useState("");
-  const [cardCount, setCardCount] = useState(4);
-  const [photoDataUrl, setPhotoDataUrl] = useState<string | null>(null);
-  const [cards, setCards] = useState<DraftCard[]>(() =>
-    Array.from({ length: 4 }, (_, index) => createDraftCard(index))
-  );
+  const [confirmedCards, setConfirmedCards] = useState<DraftCard[]>([]);
+  const [currentCard, setCurrentCard] = useState<DraftCard>(() => createDraftCard(0));
   const [loadingFolders, setLoadingFolders] = useState(true);
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [ocrRunning, setOcrRunning] = useState(false);
@@ -231,34 +260,40 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
       .finally(() => setLoadingFolders(false));
   }, []);
 
-  const columns = gridColumns(cardCount);
   const totalCents = useMemo(
     () =>
-      cards.reduce((total, card) => {
+      confirmedCards.reduce((total, card) => {
         const cents = parseMoneyToCents(card.priceText);
         return total + (cents >= 0 ? cents * card.quantity : 0);
       }, 0),
-    [cards]
+    [confirmedCards]
   );
 
-  function resizeCards(nextCount: number) {
-    setCardCount(nextCount);
-    setCards((current) =>
-      Array.from({ length: nextCount }, (_, index) => current[index] ?? createDraftCard(index))
-    );
-  }
+  const confirmedQuantity = useMemo(
+    () => confirmedCards.reduce((sum, card) => sum + card.quantity, 0),
+    [confirmedCards]
+  );
 
-  function updateCard(index: number, patch: Partial<DraftCard>) {
-    setCards((current) =>
-      current.map((card, cardIndex) => (cardIndex === index ? { ...card, ...patch } : card))
-    );
+  function updateCurrentCard(patch: Partial<DraftCard>) {
+    setCurrentCard((current) => ({ ...current, ...patch }));
   }
 
   async function handlePhoto(file: File | undefined) {
     if (!file) return;
     setError("");
+    setOcrProgress("");
     try {
-      setPhotoDataUrl(await compressPhoto(file));
+      const photoDataUrl = await compressPhoto(file);
+      setCurrentCard((current) => ({
+        ...current,
+        photoDataUrl,
+        rawOcrText: "",
+        cardName: "",
+        selectedCard: null,
+        printOptions: [],
+        showPrints: false,
+        error: ""
+      }));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Não foi possível preparar a fotografia.");
     }
@@ -283,17 +318,17 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
     }
   }
 
-  async function searchCard(index: number, queryOverride?: string) {
-    const query = (queryOverride ?? cards[index].cardName).trim();
+  async function searchCurrentCard(queryOverride?: string) {
+    const query = (queryOverride ?? currentCard.cardName).trim();
     if (query.length < 2) {
-      updateCard(index, { error: "Digite pelo menos duas letras." });
+      updateCurrentCard({ error: "Digite pelo menos duas letras." });
       return;
     }
 
-    updateCard(index, { searching: true, error: "", cardName: query });
+    updateCurrentCard({ searching: true, error: "", cardName: query });
     try {
       const result = await resolveScryfallCard(query);
-      updateCard(index, {
+      updateCurrentCard({
         searching: false,
         cardName: result.name,
         selectedCard: result,
@@ -301,7 +336,7 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
         showPrints: false
       });
     } catch (caught) {
-      updateCard(index, {
+      updateCurrentCard({
         searching: false,
         selectedCard: null,
         error: caught instanceof Error ? caught.message : "Carta não encontrada."
@@ -309,73 +344,101 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
     }
   }
 
-  async function openPrints(index: number) {
-    const card = cards[index];
-    if (!card.cardName) return;
-    updateCard(index, { searching: true, error: "" });
+  async function openPrints() {
+    if (!currentCard.cardName) return;
+    updateCurrentCard({ searching: true, error: "" });
     try {
-      const prints = await listScryfallPrints(card.cardName);
-      updateCard(index, {
+      const prints = await listScryfallPrints(currentCard.cardName);
+      updateCurrentCard({
         searching: false,
         printOptions: prints,
         showPrints: true
       });
     } catch (caught) {
-      updateCard(index, {
+      updateCurrentCard({
         searching: false,
         error: caught instanceof Error ? caught.message : "Não foi possível carregar as edições."
       });
     }
   }
 
-  async function runOcr() {
-    if (!photoDataUrl) {
-      setError("Tire a fotografia antes de iniciar a leitura.");
-      return;
-    }
+  async function getOcrWorker(): Promise<OcrWorker> {
+    if (ocrWorkerRef.current) return ocrWorkerRef.current;
     if (!window.Tesseract) {
-      setError("O OCR não carregou. Você ainda pode digitar os nomes manualmente.");
+      throw new Error("O OCR não carregou. Digite o nome manualmente.");
+    }
+
+    setOcrProgress("Carregando o leitor de texto…");
+    const worker = await window.Tesseract.createWorker("eng");
+    await worker.setParameters({
+      tessedit_pageseg_mode: "7",
+      preserve_interword_spaces: "1"
+    });
+    ocrWorkerRef.current = worker;
+    return worker;
+  }
+
+  async function runOcr() {
+    if (!currentCard.photoDataUrl) {
+      setError("Fotografe a carta antes de iniciar a leitura.");
       return;
     }
 
     setOcrRunning(true);
     setError("");
-    let worker: OcrWorker | null = null;
+    updateCurrentCard({ error: "" });
     try {
-      setOcrProgress("Carregando o leitor de texto…");
-      worker = await window.Tesseract.createWorker("eng");
-      ocrWorkerRef.current = worker;
-      await worker.setParameters({
-        tessedit_pageseg_mode: "7",
-        preserve_interword_spaces: "1"
+      const worker = await getOcrWorker();
+      setOcrProgress("Lendo o nome da carta…");
+      const crop = await cropSingleCardTitle(currentCard.photoDataUrl);
+      const result = await worker.recognize(crop);
+      const rawText = result.data.text.trim();
+      const name = cleanOcrName(rawText);
+      updateCurrentCard({
+        rawOcrText: rawText,
+        cardName: name,
+        selectedCard: null,
+        error: name ? "" : "Não foi possível ler o nome. Digite manualmente."
       });
 
-      for (let index = 0; index < cards.length; index += 1) {
-        setOcrProgress(`Lendo carta ${index + 1} de ${cards.length}…`);
-        const crop = await cropCardTitle(photoDataUrl, index, cards.length);
-        const result = await worker.recognize(crop);
-        const rawText = result.data.text.trim();
-        const name = cleanOcrName(rawText);
-        updateCard(index, {
-          rawOcrText: rawText,
-          cardName: name,
-          selectedCard: null,
-          error: name ? "" : "Não foi possível ler o nome. Digite manualmente."
-        });
-        if (name) await searchCard(index, name);
+      if (name) {
+        setOcrProgress(`Nome lido: ${name}. Conferindo no Scryfall…`);
+        await searchCurrentCard(name);
+        setOcrProgress("Confira se a carta e a edição estão corretas.");
+      } else {
+        setOcrProgress("Não conseguimos ler o nome. Digite-o manualmente.");
       }
-      setOcrProgress("Leitura concluída. Confira os nomes e as edições.");
     } catch (caught) {
       setError(
         caught instanceof Error
-          ? `O OCR não concluiu: ${caught.message}. Você pode continuar manualmente.`
-          : "O OCR não concluiu. Você pode continuar manualmente."
+          ? `O OCR não concluiu: ${caught.message}`
+          : "O OCR não concluiu. Digite o nome manualmente."
       );
     } finally {
-      if (worker) await worker.terminate().catch(() => undefined);
-      if (ocrWorkerRef.current === worker) ocrWorkerRef.current = null;
       setOcrRunning(false);
     }
+  }
+
+  function confirmAndNext() {
+    setError("");
+    const unitPriceCents = parseMoneyToCents(currentCard.priceText);
+
+    if (!currentCard.photoDataUrl) {
+      setError("Fotografe a carta antes de confirmá-la.");
+      return;
+    }
+    if (!currentCard.selectedCard) {
+      setError("Confirme a carta correta no Scryfall antes de avançar.");
+      return;
+    }
+    if (unitPriceCents < 0) {
+      setError("Informe o valor da carta antes de avançar.");
+      return;
+    }
+
+    setConfirmedCards((current) => [...current, currentCard]);
+    setCurrentCard(createDraftCard(confirmedCards.length + 1));
+    setOcrProgress("");
   }
 
   async function finalize() {
@@ -384,21 +447,14 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
       setError("Selecione a pasta das cartas.");
       return;
     }
+    if (confirmedCards.length === 0) {
+      setError("Confirme pelo menos uma carta antes de finalizar o lote.");
+      return;
+    }
 
-    const items: CardOrderItemInput[] = [];
-    for (let index = 0; index < cards.length; index += 1) {
-      const card = cards[index];
-      const unitPriceCents = parseMoneyToCents(card.priceText);
-      if (card.cardName.trim().length < 2) {
-        setError(`Informe o nome da carta ${index + 1}.`);
-        return;
-      }
-      if (unitPriceCents < 0) {
-        setError(`Informe o valor da carta ${index + 1}.`);
-        return;
-      }
+    const items: CardOrderItemInput[] = confirmedCards.map((card) => {
       const selected = card.selectedCard;
-      items.push({
+      return {
         rawOcrText: card.rawOcrText,
         scryfallId: selected?.id,
         cardName: selected?.name ?? card.cardName.trim(),
@@ -410,12 +466,13 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
         condition: card.condition,
         imageUrl: selected?.imageUrl ?? undefined,
         quantity: card.quantity,
-        unitPriceCents
-      });
-    }
+        unitPriceCents: parseMoneyToCents(card.priceText)
+      };
+    });
 
     setSaving(true);
     try {
+      const photoDataUrl = await composeOrderPhoto(confirmedCards);
       const updated = await createCardOrder(tabId, {
         folderId,
         photoDataUrl,
@@ -470,27 +527,19 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
       </section>
 
       <section className="card-step">
-        <span className="eyebrow">2. Fotografia</span>
-        <h3>Organize as cartas em grade</h3>
+        <span className="eyebrow">2. Carta {confirmedCards.length + 1}</span>
+        <h3>Fotografe uma carta</h3>
         <p className="card-help">
-          Coloque uma carta em cada posição, sem sobrepor, seguindo a ordem da esquerda para a direita.
+          Preencha quase toda a tela com uma única carta, mantendo o nome visível e evitando reflexos.
         </p>
 
-        <label className="field">
-          <span>Quantidade de cartas nesta foto</span>
-          <select
-            value={cardCount}
-            onChange={(event) => resizeCards(Number(event.target.value))}
-          >
-            {Array.from({ length: 12 }, (_, index) => index + 1).map((value) => (
-              <option key={value} value={value}>{value}</option>
-            ))}
-          </select>
-        </label>
-
-        <label className="photo-picker">
-          {photoDataUrl ? <img src={photoDataUrl} alt="Lote fotografado" /> : <Camera aria-hidden="true" />}
-          <span>{photoDataUrl ? "Trocar fotografia" : "Tirar fotografia"}</span>
+        <label className="photo-picker photo-picker--single">
+          {currentCard.photoDataUrl ? (
+            <img src={currentCard.photoDataUrl} alt="Carta fotografada" />
+          ) : (
+            <Camera aria-hidden="true" />
+          )}
+          <span>{currentCard.photoDataUrl ? "Fotografar novamente" : "Fotografar carta"}</span>
           <input
             type="file"
             accept="image/jpeg,image/png,image/webp"
@@ -499,206 +548,210 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
           />
         </label>
 
-        {photoDataUrl && (
-          <div
-            className="photo-grid-preview"
-            style={{ gridTemplateColumns: `repeat(${columns}, 1fr)` }}
-            aria-label="Ordem das cartas na fotografia"
-          >
-            {cards.map((card, index) => <span key={card.key}>{index + 1}</span>)}
-          </div>
-        )}
-
         <button
           type="button"
           className="button button--full"
-          disabled={!photoDataUrl || ocrRunning}
+          disabled={!currentCard.photoDataUrl || ocrRunning}
           onClick={runOcr}
         >
           {ocrRunning ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}
-          {ocrRunning ? "Lendo nomes…" : "Ler nomes com OCR"}
+          {ocrRunning ? "Lendo nome…" : "Ler nome da carta"}
         </button>
         {ocrProgress && <small className="field-hint">{ocrProgress}</small>}
-        <small className="field-hint">
-          O OCR é apenas um auxílio. Você sempre poderá corrigir ou digitar o nome manualmente.
-        </small>
       </section>
 
       <section className="card-step">
-        <span className="eyebrow">3. Conferência e preços</span>
-        <h3>Confira carta por carta</h3>
+        <span className="eyebrow">3. Conferência</span>
+        <h3>Confirme a carta e informe o preço</h3>
 
-        <div className="card-draft-list">
-          {cards.map((card, index) => (
-            <article className="card-draft" key={card.key}>
-              <div className="card-draft__number">{index + 1}</div>
-              {card.selectedCard?.imageUrl ? (
-                <img className="card-thumb" src={card.selectedCard.imageUrl} alt="" />
-              ) : (
-                <div className="card-thumb card-thumb--empty"><ImagePlus size={22} /></div>
-              )}
+        <article className="card-draft card-draft--current">
+          {currentCard.selectedCard?.imageUrl ? (
+            <img className="card-thumb" src={currentCard.selectedCard.imageUrl} alt="" />
+          ) : (
+            <div className="card-thumb card-thumb--empty"><ImagePlus size={22} /></div>
+          )}
 
-              <div className="card-draft__body">
-                <label className="field field--compact">
-                  <span>Nome da carta</span>
-                  <div className="card-search-row">
-                    <input
-                      value={card.cardName}
-                      onChange={(event) => updateCard(index, {
-                        cardName: event.target.value,
-                        selectedCard: null,
-                        error: ""
-                      })}
-                      placeholder="Digite ou confira o nome"
-                    />
-                    <button
-                      type="button"
-                      className="icon-button"
-                      disabled={card.searching || card.cardName.trim().length < 2}
-                      aria-label="Buscar no Scryfall"
-                      onClick={() => searchCard(index)}
-                    >
-                      {card.searching ? <LoaderCircle className="spin" size={18} /> : <Search size={18} />}
-                    </button>
-                  </div>
-                </label>
-
-                {card.selectedCard && (
-                  <div className="card-match">
-                    <Check size={15} />
-                    <span>
-                      {card.selectedCard.setName} · #{card.selectedCard.collectorNumber}
-                    </span>
-                    <button type="button" onClick={() => openPrints(index)}>Trocar edição</button>
-                  </div>
-                )}
-
-                {card.showPrints && (
-                  <div className="print-picker">
-                    {card.printOptions.map((option) => (
-                      <button
-                        type="button"
-                        key={option.id}
-                        className={card.selectedCard?.id === option.id ? "selected" : ""}
-                        onClick={() => updateCard(index, {
-                          selectedCard: option,
-                          cardName: option.name,
-                          showPrints: false
-                        })}
-                      >
-                        {option.imageUrl ? <img src={option.imageUrl} alt="" /> : <span>Sem imagem</span>}
-                        <small>{option.setCode.toUpperCase()} · #{option.collectorNumber}</small>
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                {card.error && <small className="card-error">{card.error}</small>}
-
-                <div className="card-option-grid">
-                  <label className="field field--compact">
-                    <span>Condição</span>
-                    <select
-                      value={card.condition}
-                      onChange={(event) => updateCard(index, { condition: event.target.value as CardCondition })}
-                    >
-                      {conditions.map((condition) => <option key={condition}>{condition}</option>)}
-                    </select>
-                  </label>
-                  <label className="field field--compact">
-                    <span>Acabamento</span>
-                    <select
-                      value={card.finish}
-                      onChange={(event) => updateCard(index, { finish: event.target.value as Finish })}
-                    >
-                      {finishes.map((finish) => (
-                        <option key={finish.value} value={finish.value}>{finish.label}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="field field--compact">
-                    <span>Qtd.</span>
-                    <input
-                      type="number"
-                      min="1"
-                      max="20"
-                      inputMode="numeric"
-                      value={card.quantity}
-                      onChange={(event) => updateCard(index, {
-                        quantity: Math.max(1, Math.min(20, Number(event.target.value) || 1))
-                      })}
-                    />
-                  </label>
-                  <label className="field field--compact">
-                    <span>Valor unitário</span>
-                    <input
-                      inputMode="decimal"
-                      value={card.priceText}
-                      onChange={(event) => updateCard(index, {
-                        priceText: event.target.value.replace(/[^\d,.]/g, "")
-                      })}
-                      placeholder="0,00"
-                    />
-                  </label>
-                </div>
-
-                <a
-                  className={`button button--compact liga-button ${card.cardName.trim().length < 2 ? "disabled" : ""}`}
-                  href={card.cardName.trim().length >= 2 ? buildLigaMagicUrl(card.cardName.trim()) : undefined}
-                  target="_blank"
-                  rel="noreferrer"
-                  onClick={() => {
-                    if (card.cardName) navigator.clipboard?.writeText(card.cardName).catch(() => undefined);
-                  }}
-                >
-                  <ExternalLink size={16} /> Abrir na LigaMagic
-                </a>
-              </div>
-
-              {cards.length > 1 && (
+          <div className="card-draft__body">
+            <label className="field field--compact">
+              <span>Nome da carta</span>
+              <div className="card-search-row">
+                <input
+                  value={currentCard.cardName}
+                  onChange={(event) => updateCurrentCard({
+                    cardName: event.target.value,
+                    selectedCard: null,
+                    error: ""
+                  })}
+                  placeholder="Digite ou confira o nome"
+                />
                 <button
                   type="button"
-                  className="icon-button icon-button--danger card-remove"
-                  aria-label={`Remover carta ${index + 1}`}
-                  onClick={() => {
-                    const next = cards.filter((_, cardIndex) => cardIndex !== index);
-                    setCards(next);
-                    setCardCount(next.length);
-                  }}
+                  className="icon-button"
+                  disabled={currentCard.searching || currentCard.cardName.trim().length < 2}
+                  aria-label="Buscar no Scryfall"
+                  onClick={() => searchCurrentCard()}
                 >
-                  <Trash2 size={16} />
+                  {currentCard.searching ? <LoaderCircle className="spin" size={18} /> : <Search size={18} />}
                 </button>
-              )}
-            </article>
-          ))}
-        </div>
+              </div>
+            </label>
 
-        {cards.length < 12 && (
-          <button
-            type="button"
-            className="button button--compact"
-            onClick={() => {
-              setCards((current) => [...current, createDraftCard(current.length)]);
-              setCardCount((current) => current + 1);
-            }}
-          >
-            <Plus size={16} /> Adicionar carta manualmente
-          </button>
+            {currentCard.selectedCard && (
+              <div className="card-match">
+                <Check size={15} />
+                <span>
+                  {currentCard.selectedCard.setName} · #{currentCard.selectedCard.collectorNumber}
+                </span>
+                <button type="button" onClick={openPrints}>Trocar edição</button>
+              </div>
+            )}
+
+            {currentCard.showPrints && (
+              <div className="print-picker">
+                {currentCard.printOptions.map((option) => (
+                  <button
+                    type="button"
+                    key={option.id}
+                    className={currentCard.selectedCard?.id === option.id ? "selected" : ""}
+                    onClick={() => updateCurrentCard({
+                      selectedCard: option,
+                      cardName: option.name,
+                      showPrints: false
+                    })}
+                  >
+                    {option.imageUrl ? <img src={option.imageUrl} alt="" /> : <span>Sem imagem</span>}
+                    <small>{option.setCode.toUpperCase()} · #{option.collectorNumber}</small>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {currentCard.error && <small className="card-error">{currentCard.error}</small>}
+
+            <div className="card-option-grid">
+              <label className="field field--compact">
+                <span>Condição</span>
+                <select
+                  value={currentCard.condition}
+                  onChange={(event) => updateCurrentCard({ condition: event.target.value as CardCondition })}
+                >
+                  {conditions.map((condition) => <option key={condition}>{condition}</option>)}
+                </select>
+              </label>
+              <label className="field field--compact">
+                <span>Acabamento</span>
+                <select
+                  value={currentCard.finish}
+                  onChange={(event) => updateCurrentCard({ finish: event.target.value as Finish })}
+                >
+                  {finishes.map((finish) => (
+                    <option key={finish.value} value={finish.value}>{finish.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="field field--compact">
+                <span>Qtd.</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="20"
+                  inputMode="numeric"
+                  value={currentCard.quantity}
+                  onChange={(event) => updateCurrentCard({
+                    quantity: Math.max(1, Math.min(20, Number(event.target.value) || 1))
+                  })}
+                />
+              </label>
+              <label className="field field--compact">
+                <span>Valor unitário</span>
+                <input
+                  inputMode="decimal"
+                  value={currentCard.priceText}
+                  onChange={(event) => updateCurrentCard({
+                    priceText: event.target.value.replace(/[^\d,.]/g, "")
+                  })}
+                  placeholder="0,00"
+                />
+              </label>
+            </div>
+
+            <a
+              className={`button button--compact liga-button ${currentCard.cardName.trim().length < 2 ? "disabled" : ""}`}
+              href={currentCard.cardName.trim().length >= 2 ? buildLigaMagicUrl(currentCard.cardName.trim()) : undefined}
+              target="_blank"
+              rel="noreferrer"
+              onClick={() => {
+                if (currentCard.cardName) {
+                  navigator.clipboard?.writeText(currentCard.cardName).catch(() => undefined);
+                }
+              }}
+            >
+              <ExternalLink size={16} /> Abrir na LigaMagic
+            </a>
+          </div>
+        </article>
+
+        <button
+          type="button"
+          className="button button--primary button--full"
+          disabled={!currentCard.photoDataUrl || !currentCard.selectedCard || parseMoneyToCents(currentCard.priceText) < 0}
+          onClick={confirmAndNext}
+        >
+          <Check size={18} /> Confirmar carta e fotografar próxima
+        </button>
+      </section>
+
+      <section className="card-step">
+        <span className="eyebrow">4. Lote</span>
+        <h3>Cartas confirmadas</h3>
+
+        {confirmedCards.length === 0 ? (
+          <p className="card-help">Nenhuma carta confirmada ainda.</p>
+        ) : (
+          <div className="confirmed-card-list">
+            {confirmedCards.map((card, index) => {
+              const unitPriceCents = parseMoneyToCents(card.priceText);
+              return (
+                <article className="confirmed-card" key={card.key}>
+                  {card.selectedCard?.imageUrl ? (
+                    <img src={card.selectedCard.imageUrl} alt="" />
+                  ) : (
+                    <div className="confirmed-card__empty"><ImagePlus size={18} /></div>
+                  )}
+                  <div>
+                    <strong>{index + 1}. {card.selectedCard?.name ?? card.cardName}</strong>
+                    <small>
+                      {card.selectedCard?.setCode.toUpperCase()} · #{card.selectedCard?.collectorNumber} · {card.condition}
+                    </small>
+                    <span>{card.quantity} × {formatMoney(unitPriceCents)}</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="icon-button icon-button--danger"
+                    aria-label={`Remover ${card.cardName}`}
+                    onClick={() => setConfirmedCards((current) => current.filter((item) => item.key !== card.key))}
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </article>
+              );
+            })}
+          </div>
         )}
       </section>
 
       <section className="card-order-total">
         <div>
-          <span>{cards.reduce((sum, card) => sum + card.quantity, 0)} cartas</span>
+          <span>{confirmedQuantity} cartas confirmadas</span>
           <strong>{formatMoney(totalCents)}</strong>
         </div>
         <button
           type="button"
           className="button button--primary"
-          disabled={busy || saving}
+          disabled={busy || saving || confirmedCards.length === 0}
           onClick={finalize}
         >
-          {saving ? "Adicionando…" : "Adicionar à comanda"}
+          {saving ? "Finalizando…" : "Finalizar lote"}
         </button>
       </section>
     </div>
