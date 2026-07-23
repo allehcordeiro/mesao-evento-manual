@@ -18,6 +18,9 @@ class HttpError extends Error {
 
 const SESSION_COOKIE = "mesao_session";
 const SESSION_SECONDS = 60 * 60 * 24 * 30;
+const CARD_PHOTO_RETENTION_DAYS = 7;
+const MAX_CARD_PHOTO_DATA_URL_LENGTH = 900_000;
+
 
 function json(data: unknown, status = 200, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(data), {
@@ -132,6 +135,60 @@ function id(prefix: string): string {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function scryfallImageUrl(card: Record<string, unknown>): string | null {
+  const imageUris = card.image_uris as Record<string, unknown> | undefined;
+  if (imageUris?.normal) return String(imageUris.normal);
+
+  const faces = card.card_faces as Array<Record<string, unknown>> | undefined;
+  const firstFaceImages = faces?.[0]?.image_uris as Record<string, unknown> | undefined;
+  return firstFaceImages?.normal ? String(firstFaceImages.normal) : null;
+}
+
+function mapScryfallCard(card: Record<string, unknown>) {
+  return {
+    id: String(card.id),
+    name: String(card.name),
+    printedName: card.printed_name ? String(card.printed_name) : null,
+    setCode: String(card.set ?? ""),
+    setName: String(card.set_name ?? ""),
+    collectorNumber: String(card.collector_number ?? ""),
+    language: String(card.lang ?? "en"),
+    imageUrl: scryfallImageUrl(card)
+  };
+}
+
+async function scryfallFetch(path: string): Promise<Record<string, unknown>> {
+  const response = await fetch(`https://api.scryfall.com${path}`, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "MesaoEvento/0.2 (card-order lookup)"
+    }
+  });
+
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok) {
+    const message = payload.details ? String(payload.details) : "Carta não encontrada no Scryfall.";
+    throw new HttpError(response.status === 404 ? 404 : 502, message);
+  }
+  return payload;
+}
+
+async function clearExpiredCardPhotos(db: D1Database): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE card_orders
+       SET photo_data_url = NULL,
+           photo_size_bytes = 0,
+           photo_deleted_at = ?,
+           updated_at = ?
+       WHERE photo_data_url IS NOT NULL
+         AND photo_expires_at IS NOT NULL
+         AND photo_expires_at <= ?`
+    )
+    .bind(now(), now(), now())
+    .run();
 }
 
 function mapEvent(row: Record<string, unknown>) {
@@ -364,17 +421,21 @@ async function getTabDetail(db: D1Database, tabId: string) {
   const items = await db
     .prepare(
       `SELECT
-         id,
-         product_id,
-         product_name_snapshot,
-         quantity,
-         unit_price_cents,
-         total_price_cents,
-         preparation_status,
-         created_at
-       FROM tab_items
-       WHERE tab_id = ?
-       ORDER BY created_at DESC`
+         ti.id,
+         ti.product_id,
+         ti.product_name_snapshot,
+         ti.quantity,
+         ti.unit_price_cents,
+         ti.total_price_cents,
+         ti.preparation_status,
+         ti.created_at,
+         ti.card_order_id,
+         co.card_count,
+         co.folder_name_snapshot AS card_folder_name
+       FROM tab_items ti
+       LEFT JOIN card_orders co ON co.id = ti.card_order_id
+       WHERE ti.tab_id = ?
+       ORDER BY ti.created_at DESC`
     )
     .bind(tabId)
     .all<Record<string, unknown>>();
@@ -403,7 +464,13 @@ async function getTabDetail(db: D1Database, tabId: string) {
       preparationStatus: item.preparation_status
         ? String(item.preparation_status)
         : null,
-      createdAt: String(item.created_at)
+      createdAt: String(item.created_at),
+      cardOrderId: item.card_order_id ? String(item.card_order_id) : null,
+      cardCount:
+        item.card_count === null || item.card_count === undefined
+          ? null
+          : Number(item.card_count),
+      cardFolderName: item.card_folder_name ? String(item.card_folder_name) : null
     })),
     payments: payments.results.map((payment) => ({
       id: String(payment.id),
@@ -416,6 +483,7 @@ async function getTabDetail(db: D1Database, tabId: string) {
 }
 
 async function handleBootstrap(env: Env): Promise<Response> {
+  await clearExpiredCardPhotos(env.DB);
   const eventRow = await activeEvent(env.DB);
   const eventId = String(eventRow.id);
   const [stats, products, tabs, kitchen] = await Promise.all([
@@ -678,6 +746,7 @@ async function handleRemoveItem(
       `SELECT
          ti.product_id,
          ti.quantity,
+         ti.card_order_id,
          t.event_id,
          t.status
        FROM tab_items ti
@@ -690,7 +759,7 @@ async function handleRemoveItem(
   if (!item) throw new HttpError(404, "Item não encontrado.");
   if (item.status !== "open") throw new HttpError(409, "Esta comanda já está fechada.");
 
-  await env.DB.batch([
+  const statements = [
     env.DB.prepare("DELETE FROM tab_items WHERE id = ?").bind(itemId),
     env.DB
       .prepare(
@@ -702,7 +771,15 @@ async function handleRemoveItem(
     env.DB
       .prepare("UPDATE tabs SET updated_at = ? WHERE id = ?")
       .bind(now(), tabId)
-  ]);
+  ];
+
+  if (item.card_order_id) {
+    statements.push(
+      env.DB.prepare("DELETE FROM card_orders WHERE id = ?").bind(String(item.card_order_id))
+    );
+  }
+
+  await env.DB.batch(statements);
 
   return json(await getTabDetail(env.DB, tabId));
 }
@@ -828,6 +905,366 @@ async function handleKitchen(
   });
 }
 
+function dataUrlSizeBytes(dataUrl: string): number {
+  const comma = dataUrl.indexOf(",");
+  if (comma < 0) return 0;
+  const base64 = dataUrl.slice(comma + 1);
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((base64.length * 3) / 4) - padding);
+}
+
+async function handleCardFolders(request: Request, env: Env): Promise<Response> {
+  if (request.method.toUpperCase() === "GET") {
+    const result = await env.DB
+      .prepare(
+        `SELECT id, code, name
+         FROM card_folders
+         WHERE active = 1
+         ORDER BY sort_order, name`
+      )
+      .all<Record<string, unknown>>();
+
+    return json(
+      result.results.map((folder) => ({
+        id: String(folder.id),
+        code: String(folder.code),
+        name: String(folder.name)
+      }))
+    );
+  }
+
+  const body = await bodyAsJson(request);
+  const name = stringValue(body.name);
+  if (name.length < 2 || name.length > 60) {
+    throw new HttpError(400, "Informe um nome de pasta entre 2 e 60 caracteres.");
+  }
+
+  const existing = await env.DB
+    .prepare("SELECT id, code, name FROM card_folders WHERE name = ? COLLATE NOCASE LIMIT 1")
+    .bind(name)
+    .first<Record<string, unknown>>();
+
+  if (existing) {
+    return json({
+      id: String(existing.id),
+      code: String(existing.code),
+      name: String(existing.name)
+    });
+  }
+
+  const count = await env.DB
+    .prepare("SELECT COUNT(*) AS total FROM card_folders")
+    .first<Record<string, unknown>>();
+  const code = `P-${String(Number(count?.total ?? 0) + 1).padStart(2, "0")}`;
+  const folderId = id("folder");
+  const timestamp = now();
+
+  await env.DB
+    .prepare(
+      `INSERT INTO card_folders
+        (id, code, name, active, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, 1, ?, ?, ?)`
+    )
+    .bind(folderId, code, name, Number(count?.total ?? 0) + 1, timestamp, timestamp)
+    .run();
+
+  return json({ id: folderId, code, name }, 201);
+}
+
+async function handleScryfallNamed(request: Request): Promise<Response> {
+  const query = new URL(request.url).searchParams.get("q")?.trim() ?? "";
+  if (query.length < 2) throw new HttpError(400, "Informe o nome da carta.");
+
+  const params = new URLSearchParams({ fuzzy: query });
+  try {
+    const card = await scryfallFetch(`/cards/named?${params.toString()}`);
+    return json(mapScryfallCard(card));
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.status !== 404) throw error;
+    const searchParams = new URLSearchParams({ q: query, order: "name" });
+    const result = await scryfallFetch(`/cards/search?${searchParams.toString()}`);
+    const cards = Array.isArray(result.data)
+      ? (result.data as Array<Record<string, unknown>>)
+      : [];
+    if (!cards[0]) throw error;
+    return json(mapScryfallCard(cards[0]));
+  }
+}
+
+async function handleScryfallPrints(request: Request): Promise<Response> {
+  const name = new URL(request.url).searchParams.get("name")?.trim() ?? "";
+  if (name.length < 2) throw new HttpError(400, "Informe o nome da carta.");
+
+  const safeName = name.replace(/"/g, "");
+  const params = new URLSearchParams({
+    order: "released",
+    unique: "prints",
+    q: `!"${safeName}"`
+  });
+  const result = await scryfallFetch(`/cards/search?${params.toString()}`);
+  const cards = Array.isArray(result.data)
+    ? (result.data as Array<Record<string, unknown>>)
+    : [];
+  return json(cards.slice(0, 40).map(mapScryfallCard));
+}
+
+async function handleCreateCardOrder(
+  request: Request,
+  env: Env,
+  tabId: string
+): Promise<Response> {
+  const body = await bodyAsJson(request);
+  const folderId = stringValue(body.folderId);
+  const photoDataUrl = stringValue(body.photoDataUrl) || null;
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+
+  if (!folderId) throw new HttpError(400, "Selecione a pasta das cartas.");
+  if (rawItems.length < 1 || rawItems.length > 30) {
+    throw new HttpError(400, "O pedido deve possuir entre 1 e 30 cartas.");
+  }
+
+  if (photoDataUrl) {
+    const allowedPrefix = /^data:image\/(jpeg|jpg|png|webp);base64,/i;
+    if (!allowedPrefix.test(photoDataUrl)) {
+      throw new HttpError(400, "A fotografia precisa ser JPEG, PNG ou WebP.");
+    }
+    if (photoDataUrl.length > MAX_CARD_PHOTO_DATA_URL_LENGTH) {
+      throw new HttpError(413, "A fotografia ficou muito grande. Tire uma foto novamente.");
+    }
+  }
+
+  const tab = await env.DB
+    .prepare("SELECT event_id, status FROM tabs WHERE id = ?")
+    .bind(tabId)
+    .first<Record<string, unknown>>();
+  if (!tab) throw new HttpError(404, "Comanda não encontrada.");
+  if (tab.status !== "open") throw new HttpError(409, "Esta comanda já está fechada.");
+
+  const folder = await env.DB
+    .prepare("SELECT id, code, name FROM card_folders WHERE id = ? AND active = 1")
+    .bind(folderId)
+    .first<Record<string, unknown>>();
+  if (!folder) throw new HttpError(404, "Pasta não encontrada ou inativa.");
+
+  const product = await env.DB
+    .prepare(
+      `SELECT p.id, p.name
+       FROM event_products ep
+       INNER JOIN products p ON p.id = ep.product_id
+       WHERE ep.event_id = ?
+         AND ep.product_id = 'prod_single_cards'
+         AND ep.available = 1`
+    )
+    .bind(String(tab.event_id))
+    .first<Record<string, unknown>>();
+  if (!product) {
+    throw new HttpError(409, "O produto Cartas avulsas não está disponível neste evento.");
+  }
+
+  const items = rawItems.map((raw, index) => {
+    const item = (raw ?? {}) as JsonRecord;
+    const cardName = stringValue(item.cardName);
+    const quantity = Math.floor(numberValue(item.quantity || 1));
+    const unitPriceCents = Math.floor(numberValue(item.unitPriceCents));
+    const finish = stringValue(item.finish) || "normal";
+    const condition = stringValue(item.condition) || "NM";
+
+    if (cardName.length < 2) {
+      throw new HttpError(400, `Informe o nome da carta ${index + 1}.`);
+    }
+    if (!Number.isFinite(quantity) || quantity < 1 || quantity > 20) {
+      throw new HttpError(400, `Quantidade inválida na carta ${index + 1}.`);
+    }
+    if (!Number.isFinite(unitPriceCents) || unitPriceCents < 0) {
+      throw new HttpError(400, `Valor inválido na carta ${index + 1}.`);
+    }
+    if (!["normal", "foil", "etched"].includes(finish)) {
+      throw new HttpError(400, `Acabamento inválido na carta ${index + 1}.`);
+    }
+    if (!["NM", "SP", "MP", "HP", "D"].includes(condition)) {
+      throw new HttpError(400, `Condição inválida na carta ${index + 1}.`);
+    }
+
+    return {
+      sequence: index + 1,
+      rawOcrText: stringValue(item.rawOcrText) || null,
+      scryfallId: stringValue(item.scryfallId) || null,
+      cardName,
+      setCode: stringValue(item.setCode) || null,
+      setName: stringValue(item.setName) || null,
+      collectorNumber: stringValue(item.collectorNumber) || null,
+      language: stringValue(item.language) || null,
+      finish,
+      condition,
+      imageUrl: stringValue(item.imageUrl) || null,
+      quantity,
+      unitPriceCents,
+      totalPriceCents: quantity * unitPriceCents
+    };
+  });
+
+  const totalCents = items.reduce((sum, item) => sum + item.totalPriceCents, 0);
+  const cardCount = items.reduce((sum, item) => sum + item.quantity, 0);
+  const orderId = id("card_order");
+  const tabItemId = id("item");
+  const timestamp = now();
+  const photoSizeBytes = photoDataUrl ? dataUrlSizeBytes(photoDataUrl) : 0;
+  const expiresAt = photoDataUrl
+    ? new Date(Date.now() + CARD_PHOTO_RETENTION_DAYS * 86_400_000).toISOString()
+    : null;
+
+  const statements = [
+    env.DB
+      .prepare(
+        `INSERT INTO card_orders
+          (id, tab_id, folder_id, folder_code_snapshot, folder_name_snapshot,
+           status, card_count, total_cents, photo_data_url, photo_size_bytes,
+           photo_expires_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        orderId,
+        tabId,
+        folderId,
+        String(folder.code),
+        String(folder.name),
+        cardCount,
+        totalCents,
+        photoDataUrl,
+        photoSizeBytes,
+        expiresAt,
+        timestamp,
+        timestamp
+      )
+  ];
+
+  for (const item of items) {
+    statements.push(
+      env.DB
+        .prepare(
+          `INSERT INTO card_order_items
+            (id, card_order_id, sequence, raw_ocr_text, scryfall_id, card_name,
+             set_code, set_name, collector_number, language, finish,
+             card_condition, image_url, quantity, unit_price_cents,
+             total_price_cents, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(
+          id("card_item"),
+          orderId,
+          item.sequence,
+          item.rawOcrText,
+          item.scryfallId,
+          item.cardName,
+          item.setCode,
+          item.setName,
+          item.collectorNumber,
+          item.language,
+          item.finish,
+          item.condition,
+          item.imageUrl,
+          item.quantity,
+          item.unitPriceCents,
+          item.totalPriceCents,
+          timestamp,
+          timestamp
+        )
+    );
+  }
+
+  statements.push(
+    env.DB
+      .prepare(
+        `INSERT INTO tab_items
+          (id, tab_id, product_id, product_name_snapshot, quantity,
+           unit_price_cents, total_price_cents, preparation_status,
+           created_at, card_order_id)
+         VALUES (?, ?, 'prod_single_cards', ?, 1, ?, ?, NULL, ?, ?)`
+      )
+      .bind(
+        tabItemId,
+        tabId,
+        `Cartas avulsas — ${String(folder.name)}`,
+        totalCents,
+        totalCents,
+        timestamp,
+        orderId
+      ),
+    env.DB
+      .prepare(
+        `UPDATE event_products
+         SET stock_sold = stock_sold + 1
+         WHERE event_id = ? AND product_id = 'prod_single_cards'`
+      )
+      .bind(String(tab.event_id)),
+    env.DB
+      .prepare("UPDATE tabs SET updated_at = ? WHERE id = ?")
+      .bind(timestamp, tabId)
+  );
+
+  await env.DB.batch(statements);
+  return json(await getTabDetail(env.DB, tabId), 201);
+}
+
+async function handleGetCardOrder(env: Env, cardOrderId: string): Promise<Response> {
+  await clearExpiredCardPhotos(env.DB);
+  const order = await env.DB
+    .prepare(
+      `SELECT id, tab_id, folder_id, folder_code_snapshot, folder_name_snapshot,
+              status, card_count, total_cents, photo_data_url, photo_expires_at,
+              created_at
+       FROM card_orders
+       WHERE id = ?`
+    )
+    .bind(cardOrderId)
+    .first<Record<string, unknown>>();
+
+  if (!order) throw new HttpError(404, "Pedido de cartas não encontrado.");
+
+  const result = await env.DB
+    .prepare(
+      `SELECT id, sequence, raw_ocr_text, scryfall_id, card_name, set_code,
+              set_name, collector_number, language, finish, card_condition,
+              image_url, quantity, unit_price_cents, total_price_cents
+       FROM card_order_items
+       WHERE card_order_id = ?
+       ORDER BY sequence`
+    )
+    .bind(cardOrderId)
+    .all<Record<string, unknown>>();
+
+  return json({
+    id: String(order.id),
+    tabId: String(order.tab_id),
+    folderId: String(order.folder_id),
+    folderCode: String(order.folder_code_snapshot),
+    folderName: String(order.folder_name_snapshot),
+    status: String(order.status),
+    cardCount: Number(order.card_count),
+    totalCents: Number(order.total_cents),
+    photoDataUrl: order.photo_data_url ? String(order.photo_data_url) : null,
+    photoExpiresAt: order.photo_expires_at ? String(order.photo_expires_at) : null,
+    createdAt: String(order.created_at),
+    items: result.results.map((item) => ({
+      id: String(item.id),
+      sequence: Number(item.sequence),
+      rawOcrText: item.raw_ocr_text ? String(item.raw_ocr_text) : null,
+      scryfallId: item.scryfall_id ? String(item.scryfall_id) : null,
+      cardName: String(item.card_name),
+      setCode: item.set_code ? String(item.set_code) : null,
+      setName: item.set_name ? String(item.set_name) : null,
+      collectorNumber: item.collector_number ? String(item.collector_number) : null,
+      language: item.language ? String(item.language) : null,
+      finish: String(item.finish),
+      condition: String(item.card_condition),
+      imageUrl: item.image_url ? String(item.image_url) : null,
+      quantity: Number(item.quantity),
+      unitPriceCents: Number(item.unit_price_cents),
+      totalPriceCents: Number(item.total_price_cents)
+    }))
+  });
+}
+
 async function handleUpdateEvent(
   request: Request,
   env: Env,
@@ -934,6 +1371,15 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (!authenticated) throw new HttpError(401, "Sessão expirada.");
 
   if (path === "/api/bootstrap" && method === "GET") return handleBootstrap(env);
+  if (path === "/api/card-folders" && (method === "GET" || method === "POST")) {
+    return handleCardFolders(request, env);
+  }
+  if (path === "/api/cards/scryfall/named" && method === "GET") {
+    return handleScryfallNamed(request);
+  }
+  if (path === "/api/cards/scryfall/prints" && method === "GET") {
+    return handleScryfallPrints(request);
+  }
   if (path === "/api/people" && method === "GET") return handlePeople(request, env);
   if (path === "/api/check-ins" && method === "POST") {
     return handleCheckIn(request, env);
@@ -942,6 +1388,20 @@ async function route(request: Request, env: Env): Promise<Response> {
   const tabMatch = path.match(/^\/api\/tabs\/([^/]+)$/);
   if (tabMatch && method === "GET") {
     return json(await getTabDetail(env.DB, decodeURIComponent(tabMatch[1])));
+  }
+
+  const createCardOrderMatch = path.match(/^\/api\/tabs\/([^/]+)\/card-orders$/);
+  if (createCardOrderMatch && method === "POST") {
+    return handleCreateCardOrder(
+      request,
+      env,
+      decodeURIComponent(createCardOrderMatch[1])
+    );
+  }
+
+  const cardOrderMatch = path.match(/^\/api\/card-orders\/([^/]+)$/);
+  if (cardOrderMatch && method === "GET") {
+    return handleGetCardOrder(env, decodeURIComponent(cardOrderMatch[1]));
   }
 
   const addItemMatch = path.match(/^\/api\/tabs\/([^/]+)\/items$/);

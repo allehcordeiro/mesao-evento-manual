@@ -10,6 +10,8 @@ import {
   X
 } from "lucide-react";
 import type { PaymentMethod, Product, TabDetail } from "../types";
+import { CardOrderFlow } from "./CardOrderFlow";
+import { CardOrderDetails } from "./CardOrderDetails";
 import { formatMoney, paymentMethodLabels, preparationStatusLabels } from "../lib/format";
 
 interface TabDrawerProps {
@@ -21,6 +23,7 @@ interface TabDrawerProps {
   onRemoveItem: (itemId: string) => Promise<void>;
   onPayment: (amountCents: number, method: PaymentMethod) => Promise<void>;
   onCloseTab: () => Promise<void>;
+  onCardOrderCompleted: (tab: TabDetail) => void;
 }
 
 const methods: PaymentMethod[] = ["pix", "debit", "credit", "cash", "courtesy"];
@@ -33,9 +36,11 @@ export function TabDrawer({
   onAddItem,
   onRemoveItem,
   onPayment,
-  onCloseTab
+  onCloseTab,
+  onCardOrderCompleted
 }: TabDrawerProps) {
-  const [view, setView] = useState<"summary" | "products" | "payment">("summary");
+  const [view, setView] = useState<"summary" | "products" | "payment" | "cards" | "cardDetails">("summary");
+  const [selectedCardOrderId, setSelectedCardOrderId] = useState<string | null>(null);
   const [category, setCategory] = useState("Todos");
   const [productQuery, setProductQuery] = useState("");
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("pix");
@@ -79,14 +84,28 @@ export function TabDrawer({
       >
         <header className="drawer-header">
           {view !== "summary" ? (
-            <button className="icon-button" aria-label="Voltar" onClick={() => setView("summary")}>
+            <button
+              className="icon-button"
+              aria-label="Voltar"
+              onClick={() => setView(view === "cards" ? "products" : "summary")}
+            >
               <ChevronLeft aria-hidden="true" />
             </button>
           ) : (
             <div className="tab-number tab-number--large">{tab.number}</div>
           )}
           <div className="drawer-title">
-            <span>{view === "summary" ? "Comanda" : view === "products" ? "Adicionar item" : "Pagamento"}</span>
+            <span>{
+              view === "summary"
+                ? "Comanda"
+                : view === "products"
+                  ? "Adicionar item"
+                  : view === "payment"
+                    ? "Pagamento"
+                    : view === "cards"
+                      ? "Cartas avulsas"
+                      : "Detalhes das cartas"
+            }</span>
             <strong>{tab.personName}</strong>
           </div>
           <button className="icon-button" aria-label="Fechar janela" onClick={onClose}>
@@ -133,6 +152,18 @@ export function TabDrawer({
                         <span>{formatMoney(item.unitPriceCents)} cada</span>
                         {item.preparationStatus && (
                           <small className="status-note">Preparo: {preparationStatusLabels[item.preparationStatus]}</small>
+                        )}
+                        {item.cardOrderId && (
+                          <button
+                            type="button"
+                            className="item-detail-link"
+                            onClick={() => {
+                              setSelectedCardOrderId(item.cardOrderId);
+                              setView("cardDetails");
+                            }}
+                          >
+                            Ver {item.cardCount ?? ""} cartas · {item.cardFolderName ?? "Pasta"}
+                          </button>
                         )}
                       </div>
                       <strong>{formatMoney(item.totalPriceCents)}</strong>
@@ -238,12 +269,18 @@ export function TabDrawer({
                     className="product-card"
                     key={product.id}
                     disabled={busy || remaining === 0}
-                    onClick={() => onAddItem(product.id)}
+                    onClick={() => {
+                      if (product.id === "prod_single_cards") {
+                        setView("cards");
+                        return;
+                      }
+                      onAddItem(product.id);
+                    }}
                   >
                     <span className="product-category">{product.category}</span>
                     <strong>{product.name}</strong>
                     <div>
-                      <span>{formatMoney(product.priceCents)}</span>
+                      <span>{product.id === "prod_single_cards" ? "Montar pedido" : formatMoney(product.priceCents)}</span>
                       <Plus size={18} aria-hidden="true" />
                     </div>
                     {remaining !== null && <small>{remaining} disponíveis</small>}
@@ -252,6 +289,21 @@ export function TabDrawer({
               })}
             </div>
           </div>
+        )}
+
+        {view === "cards" && (
+          <CardOrderFlow
+            tabId={tab.id}
+            busy={busy}
+            onCompleted={(updated) => {
+              onCardOrderCompleted(updated);
+              setView("summary");
+            }}
+          />
+        )}
+
+        {view === "cardDetails" && selectedCardOrderId && (
+          <CardOrderDetails cardOrderId={selectedCardOrderId} />
         )}
 
         {view === "payment" && (
