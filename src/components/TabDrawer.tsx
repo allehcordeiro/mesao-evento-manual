@@ -294,6 +294,7 @@ export function TabDrawer({
         {view === "cards" && (
           <CardOrderFlow
             tabId={tab.id}
+            tabLabel={`${tab.number} · ${tab.personName}`}
             busy={busy}
             onCompleted={(updated) => {
               onCardOrderCompleted(updated);

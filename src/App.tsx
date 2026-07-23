@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   CalendarCog,
+  Camera,
   ChefHat,
   ClipboardList,
   Heart,
@@ -37,8 +38,9 @@ import { TabsList } from "./components/TabsList";
 import { Kitchen } from "./components/Kitchen";
 import { TabDrawer } from "./components/TabDrawer";
 import { EventSettings } from "./components/EventSettings";
+import { CardsPage } from "./components/CardsPage";
 
-type Page = "home" | "checkin" | "tabs" | "kitchen";
+type Page = "home" | "checkin" | "cards" | "tabs" | "kitchen";
 
 export default function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
@@ -197,6 +199,17 @@ export default function App() {
             onOpenTab={(tab) => setSelectedTab(tab)}
           />
         )}
+        {page === "cards" && (
+          <CardsPage
+            tabs={data.tabs}
+            busy={busy}
+            onOpenTab={openTab}
+            onCompleted={() => {
+              void loadData();
+              notify("Lote de cartas adicionado à comanda.");
+            }}
+          />
+        )}
         {page === "tabs" && <TabsList tabs={data.tabs} onSelect={openTab} />}
         {page === "kitchen" && (
           <Kitchen
@@ -225,6 +238,10 @@ export default function App() {
         <button className={page === "checkin" ? "active" : ""} onClick={() => setPage("checkin")}>
           <LogIn aria-hidden="true" />
           <span>Check-in</span>
+        </button>
+        <button className={page === "cards" ? "active" : ""} onClick={() => setPage("cards")}>
+          <Camera aria-hidden="true" />
+          <span>Cartas</span>
         </button>
         <button className={page === "tabs" ? "active" : ""} onClick={() => setPage("tabs")}>
           <ClipboardList aria-hidden="true" />
