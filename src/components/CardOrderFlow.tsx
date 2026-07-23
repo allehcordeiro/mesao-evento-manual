@@ -29,23 +29,44 @@ import { formatMoney } from "../lib/format";
 
 type Finish = CardOrderItemInput["finish"];
 type CardCondition = CardOrderItemInput["condition"];
-type OcrSource = "original" | "fallback";
+type OcrSource = "paddle-default" | "paddle-relaxed";
 
-type OcrWorker = {
-  recognize: (
-    image: string,
-    options?: Record<string, unknown>
-  ) => Promise<{ data: { text: string; confidence?: number } }>;
-  setParameters: (parameters: Record<string, string>) => Promise<void>;
-  terminate: () => Promise<void>;
-};
+interface PaddleOcrPoint {
+  0: number;
+  1: number;
+}
 
-declare global {
-  interface Window {
-    Tesseract?: {
-      createWorker: (language?: string) => Promise<OcrWorker>;
-    };
-  }
+interface PaddleOcrItem {
+  poly: PaddleOcrPoint[];
+  text: string;
+  score: number;
+}
+
+interface PaddleOcrResult {
+  image: { width: number; height: number };
+  items: PaddleOcrItem[];
+  metrics?: {
+    detMs?: number;
+    recMs?: number;
+    totalMs?: number;
+    detectedBoxes?: number;
+    recognizedCount?: number;
+  };
+  runtime?: Record<string, unknown>;
+}
+
+interface PaddleOcrEngine {
+  predict: (
+    image: Blob | HTMLCanvasElement | HTMLImageElement,
+    params?: Record<string, number | string | boolean>
+  ) => Promise<PaddleOcrResult[]>;
+  dispose: () => void;
+}
+
+interface PaddleOcrModule {
+  PaddleOCR: {
+    create: (options: Record<string, unknown>) => Promise<PaddleOcrEngine>;
+  };
 }
 
 interface OcrAttempt {
@@ -53,6 +74,8 @@ interface OcrAttempt {
   rawText: string;
   confidence: number | null;
   candidates: string[];
+  recognizedLines: Array<{ text: string; score: number; top: number }>;
+  metrics?: PaddleOcrResult["metrics"];
 }
 
 interface DraftCard {
@@ -90,6 +113,14 @@ const finishes: Array<{ value: Finish; label: string }> = [
   { value: "foil", label: "Foil" },
   { value: "etched", label: "Etched" }
 ];
+
+const PADDLE_OCR_MODULE_URL =
+  "https://cdn.jsdelivr.net/npm/@paddleocr/paddleocr-js@0.4.2/+esm";
+const ONNX_WASM_PATHS =
+  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
+
+let sharedPaddleOcr: PaddleOcrEngine | null = null;
+let sharedPaddleOcrPromise: Promise<PaddleOcrEngine> | null = null;
 
 function createDraftCard(index: number): DraftCard {
   return {
@@ -186,24 +217,16 @@ async function compressPhoto(file: File): Promise<string> {
   }
 }
 
-async function prepareFallbackForOcr(photoDataUrl: string): Promise<string> {
-  const image = await loadImage(photoDataUrl);
-  const minimumWidth = 1500;
-  const scale = image.naturalWidth < minimumWidth
-    ? Math.min(2, minimumWidth / Math.max(1, image.naturalWidth))
-    : 1;
+function dataUrlToBlob(dataUrl: string): Blob {
+  const match = /^data:([^;]+);base64,(.+)$/i.exec(dataUrl);
+  if (!match) throw new Error("A fotografia não pôde ser preparada para leitura.");
 
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-  const context = canvas.getContext("2d");
-  if (!context) throw new Error("Não foi possível preparar a tentativa alternativa do OCR.");
-
-  // O tratamento só é usado como contingência, depois que a imagem original
-  // falha. Não aumentamos o brilho para não apagar letras em molduras claras.
-  context.filter = "grayscale(1) contrast(1.16)";
-  context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL("image/png");
+  const binary = atob(match[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: match[1] });
 }
 
 function normalizeOcrLine(line: string): string {
@@ -229,32 +252,145 @@ function candidateVariants(line: string): string[] {
   return variants;
 }
 
-function extractOcrCandidates(text: string): string[] {
+interface PositionedOcrItem {
+  text: string;
+  score: number;
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  centerY: number;
+  height: number;
+}
+
+function getPositionedItem(item: PaddleOcrItem): PositionedOcrItem | null {
+  const points = Array.isArray(item.poly) ? item.poly : [];
+  if (!item.text?.trim() || points.length < 2) return null;
+
+  const xs = points.map((point) => Number(point[0])).filter(Number.isFinite);
+  const ys = points.map((point) => Number(point[1])).filter(Number.isFinite);
+  if (!xs.length || !ys.length) return null;
+
+  const left = Math.min(...xs);
+  const right = Math.max(...xs);
+  const top = Math.min(...ys);
+  const bottom = Math.max(...ys);
+  const height = Math.max(1, bottom - top);
+
+  return {
+    text: item.text.trim(),
+    score: Number.isFinite(item.score) ? item.score : 0,
+    left,
+    top,
+    right,
+    bottom,
+    centerY: top + height / 2,
+    height
+  };
+}
+
+function groupPaddleLines(result: PaddleOcrResult) {
+  const positioned = result.items
+    .map(getPositionedItem)
+    .filter((item): item is PositionedOcrItem => Boolean(item))
+    .filter((item) => item.score >= 0.16)
+    .sort((left, right) => left.top - right.top || left.left - right.left);
+
+  const groups: PositionedOcrItem[][] = [];
+  for (const item of positioned) {
+    let bestGroup: PositionedOcrItem[] | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const group of groups) {
+      const center = group.reduce((sum, current) => sum + current.centerY, 0) / group.length;
+      const averageHeight = group.reduce((sum, current) => sum + current.height, 0) / group.length;
+      const distance = Math.abs(item.centerY - center);
+      const tolerance = Math.max(10, Math.min(item.height, averageHeight) * 0.78);
+      if (distance <= tolerance && distance < bestDistance) {
+        bestGroup = group;
+        bestDistance = distance;
+      }
+    }
+
+    if (bestGroup) bestGroup.push(item);
+    else groups.push([item]);
+  }
+
+  return groups
+    .map((group) => {
+      const ordered = [...group].sort((left, right) => left.left - right.left);
+      const text = ordered.map((item) => item.text).join(" ").replace(/\s+/g, " ").trim();
+      const totalWeight = ordered.reduce((sum, item) => sum + Math.max(1, item.text.length), 0);
+      const score = ordered.reduce(
+        (sum, item) => sum + item.score * Math.max(1, item.text.length),
+        0
+      ) / totalWeight;
+      const top = Math.min(...ordered.map((item) => item.top));
+      const left = Math.min(...ordered.map((item) => item.left));
+
+      return {
+        text,
+        score,
+        top,
+        left,
+        topRatio: result.image.height > 0 ? top / result.image.height : 1
+      };
+    })
+    .filter((line) => line.text.length > 0)
+    .sort((left, right) => left.top - right.top || left.left - right.left);
+}
+
+function isPlausibleCardName(line: string): boolean {
+  if (line.length < 2 || line.length > 90 || !/[A-Za-zÀ-ÿ]{2}/.test(line)) return false;
+
+  const words = line.split(" ").filter(Boolean);
+  const oneCharacterWords = words.filter((word) => word.length === 1).length;
+  const letterCount = (line.match(/[A-Za-zÀ-ÿ]/g) ?? []).length;
+
+  if (words.length >= 3 && oneCharacterWords >= Math.ceil(words.length / 2)) return false;
+  if (letterCount < Math.max(2, Math.floor(line.length * 0.38))) return false;
+  if (/^(copyright|illustrated by|artist|collector|wizards of the coast)$/i.test(line)) return false;
+  if (/^(creature|artifact|instant|sorcery|enchantment|land|planeswalker|battle)\b/i.test(line)) return false;
+  return true;
+}
+
+function extractPaddleCandidates(result: PaddleOcrResult) {
+  const visualLines = groupPaddleLines(result);
+  const prioritized = [
+    ...visualLines.filter((line) => line.topRatio <= 0.42),
+    ...visualLines.filter((line) => line.topRatio > 0.42)
+  ];
   const seen = new Set<string>();
   const candidates: string[] = [];
 
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = normalizeOcrLine(rawLine);
-    if (line.length < 2 || !/[A-Za-zÀ-ÿ]{2}/.test(line)) continue;
+  for (const visualLine of prioritized) {
+    const normalized = normalizeOcrLine(visualLine.text);
+    if (!isPlausibleCardName(normalized)) continue;
 
-    const words = line.split(" ").filter(Boolean);
-    const oneCharacterWords = words.filter((word) => word.length === 1).length;
-    const letterCount = (line.match(/[A-Za-zÀ-ÿ]/g) ?? []).length;
-
-    if (words.length >= 3 && oneCharacterWords >= Math.ceil(words.length / 2)) continue;
-    if (letterCount < Math.max(2, Math.floor(line.length * 0.42))) continue;
-    if (/^(copyright|illustrated by|artist|collector|wizards of the coast)$/i.test(line)) continue;
-
-    for (const variant of candidateVariants(line)) {
+    for (const variant of candidateVariants(normalized)) {
       const key = variant.toLocaleLowerCase("en-US");
       if (seen.has(key)) continue;
       seen.add(key);
       candidates.push(variant);
-      if (candidates.length >= 10) return candidates;
+      if (candidates.length >= 12) break;
     }
+    if (candidates.length >= 12) break;
   }
 
-  return candidates;
+  const confidence = visualLines.length
+    ? visualLines.reduce((sum, line) => sum + line.score, 0) / visualLines.length * 100
+    : null;
+
+  return {
+    rawText: visualLines.map((line) => line.text).join("\n"),
+    candidates,
+    confidence,
+    recognizedLines: visualLines.map((line) => ({
+      text: line.text,
+      score: line.score,
+      top: line.topRatio
+    }))
+  };
 }
 
 async function composeOrderPhoto(cards: DraftCard[]): Promise<string | null> {
@@ -320,7 +456,7 @@ export function CardOrderFlow({
   const [flowStarted, setFlowStarted] = useState(false);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState("");
-  const [cameraStatus, setCameraStatus] = useState("Posicione uma carta dentro da moldura.");
+  const [cameraStatus, setCameraStatus] = useState("Centralize a carta e deixe o nome visível no topo.");
   const [autoCapture, setAutoCapture] = useState(true);
   const [ocrRunning, setOcrRunning] = useState(false);
   const [ocrProgress, setOcrProgress] = useState("");
@@ -332,7 +468,6 @@ export function CardOrderFlow({
   const streamRef = useRef<MediaStream | null>(null);
   const monitorRafRef = useRef<number | null>(null);
   const captureLockRef = useRef(false);
-  const ocrWorkerRef = useRef<OcrWorker | null>(null);
   const priceInputRef = useRef<HTMLInputElement | null>(null);
   const awaitingPriceFocusRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -366,9 +501,7 @@ export function CardOrderFlow({
   useEffect(() => () => {
     if (monitorRafRef.current !== null) cancelAnimationFrame(monitorRafRef.current);
     streamRef.current?.getTracks().forEach((track) => track.stop());
-    ocrWorkerRef.current?.terminate().catch(() => undefined);
     streamRef.current = null;
-    ocrWorkerRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -430,7 +563,7 @@ export function CardOrderFlow({
       }
       setCameraActive(true);
       setCameraStatus(autoCapture
-        ? "Movimente a carta para a moldura. A captura será automática quando ela ficar estável."
+        ? "Centralize a carta. A captura será automática quando a imagem ficar estável."
         : "Posicione a carta e toque em Capturar agora."
       );
     } catch {
@@ -448,24 +581,46 @@ export function CardOrderFlow({
     setCameraActive(false);
   }
 
-  async function getOcrWorker(): Promise<OcrWorker> {
-    if (ocrWorkerRef.current) return ocrWorkerRef.current;
-    if (!window.Tesseract) {
-      throw new Error("O OCR não carregou. Digite o nome manualmente.");
+  async function getPaddleOcr(): Promise<PaddleOcrEngine> {
+    if (sharedPaddleOcr) return sharedPaddleOcr;
+
+    if (!sharedPaddleOcrPromise) {
+      setOcrProgress("Preparando o PaddleOCR pela primeira vez…");
+      sharedPaddleOcrPromise = (async () => {
+        let paddleModule: PaddleOcrModule;
+        try {
+          paddleModule = await import(
+            /* @vite-ignore */ PADDLE_OCR_MODULE_URL
+          ) as PaddleOcrModule;
+        } catch {
+          throw new Error(
+            "O leitor PaddleOCR não carregou. Confira a internet ou digite o nome manualmente."
+          );
+        }
+
+        return paddleModule.PaddleOCR.create({
+          lang: "en",
+          ocrVersion: "PP-OCRv5",
+          worker: false,
+          ortOptions: {
+            backend: "wasm",
+            wasmPaths: ONNX_WASM_PATHS,
+            numThreads: 1,
+            simd: true
+          }
+        });
+      })().catch((error) => {
+        sharedPaddleOcrPromise = null;
+        throw error;
+      });
     }
 
-    setOcrProgress("Carregando o leitor de texto…");
-    const worker = await window.Tesseract.createWorker("eng");
-    await worker.setParameters({
-      tessedit_pageseg_mode: "3",
-      preserve_interword_spaces: "1"
-    });
-    ocrWorkerRef.current = worker;
-    return worker;
+    sharedPaddleOcr = await sharedPaddleOcrPromise;
+    return sharedPaddleOcr;
   }
 
   async function findScryfallMatch(candidates: string[]) {
-    for (const candidate of candidates.slice(0, 10)) {
+    for (const candidate of candidates.slice(0, 12)) {
       setOcrProgress(`Conferindo “${candidate}” no Scryfall…`);
       try {
         return {
@@ -477,6 +632,49 @@ export function CardOrderFlow({
       }
     }
     return null;
+  }
+
+  async function runPaddleAttempt(
+    engine: PaddleOcrEngine,
+    photoBlob: Blob,
+    source: OcrSource,
+    relaxed = false
+  ): Promise<OcrAttempt> {
+    const [result] = await engine.predict(photoBlob, relaxed
+      ? {
+          textDetLimitSideLen: 1600,
+          textDetMaxSideLimit: 2200,
+          textDetThresh: 0.18,
+          textDetBoxThresh: 0.28,
+          textDetUnclipRatio: 1.75,
+          textRecScoreThresh: 0.12
+        }
+      : {
+          textDetLimitSideLen: 1600,
+          textDetMaxSideLimit: 2200,
+          textRecScoreThresh: 0.24
+        }
+    );
+
+    if (!result) {
+      return {
+        source,
+        rawText: "",
+        confidence: null,
+        candidates: [],
+        recognizedLines: []
+      };
+    }
+
+    const extracted = extractPaddleCandidates(result);
+    return {
+      source,
+      rawText: extracted.rawText,
+      confidence: extracted.confidence,
+      candidates: extracted.candidates,
+      recognizedLines: extracted.recognizedLines,
+      metrics: result.metrics
+    };
   }
 
   async function analyzePhoto(photoDataUrl: string) {
@@ -497,44 +695,50 @@ export function CardOrderFlow({
     }));
 
     try {
-      const worker = await getOcrWorker();
-      setOcrProgress("Lendo a imagem original…");
-      const original = await worker.recognize(photoDataUrl);
-      const originalText = original.data.text.trim();
-      const originalCandidates = extractOcrCandidates(originalText);
-      const attempts: OcrAttempt[] = [{
-        source: "original",
-        rawText: originalText,
-        confidence: original.data.confidence ?? null,
-        candidates: originalCandidates
-      }];
+      const engine = await getPaddleOcr();
+      const photoBlob = dataUrlToBlob(photoDataUrl);
 
-      let match = await findScryfallMatch(originalCandidates);
-      let chosenAttempt = attempts[0];
+      setOcrProgress("PaddleOCR está localizando os textos na foto original…");
+      const defaultAttempt = await runPaddleAttempt(
+        engine,
+        photoBlob,
+        "paddle-default"
+      );
+      const attempts: OcrAttempt[] = [defaultAttempt];
+      let match = await findScryfallMatch(defaultAttempt.candidates);
+      let chosenAttempt = defaultAttempt;
 
       if (!match) {
-        setOcrProgress("A leitura original não encontrou a carta. Tentando contraste leve…");
-        const fallbackImage = await prepareFallbackForOcr(photoDataUrl);
-        const fallback = await worker.recognize(fallbackImage);
-        const fallbackText = fallback.data.text.trim();
-        const fallbackCandidates = extractOcrCandidates(fallbackText);
-        const fallbackAttempt: OcrAttempt = {
-          source: "fallback",
-          rawText: fallbackText,
-          confidence: fallback.data.confidence ?? null,
-          candidates: fallbackCandidates
-        };
-        attempts.push(fallbackAttempt);
-        match = await findScryfallMatch(fallbackCandidates);
-        chosenAttempt = match ? fallbackAttempt : attempts[0];
+        setOcrProgress(
+          "A primeira leitura não encontrou a carta. Relendo a mesma foto com maior sensibilidade…"
+        );
+        const relaxedAttempt = await runPaddleAttempt(
+          engine,
+          photoBlob,
+          "paddle-relaxed",
+          true
+        );
+        attempts.push(relaxedAttempt);
+
+        const newCandidates = relaxedAttempt.candidates.filter(
+          (candidate) => !defaultAttempt.candidates.some(
+            (existing) => existing.toLocaleLowerCase("en-US") === candidate.toLocaleLowerCase("en-US")
+          )
+        );
+        match = await findScryfallMatch(newCandidates);
+        if (match) chosenAttempt = relaxedAttempt;
       }
+
+      const allCandidates = Array.from(new Set(
+        attempts.flatMap((attempt) => attempt.candidates)
+      ));
 
       if (match) {
         setCurrentCard((current) => ({
           ...current,
           photoDataUrl,
           rawOcrText: chosenAttempt.rawText,
-          ocrCandidates: chosenAttempt.candidates,
+          ocrCandidates: allCandidates,
           ocrAttempts: attempts,
           matchedCandidate: match.candidate,
           cardName: match.card.name,
@@ -544,32 +748,38 @@ export function CardOrderFlow({
           searching: false,
           error: ""
         }));
-        setOcrProgress(`Encontramos “${match.card.name}”. Confira a imagem e informe o preço.`);
+        setOcrProgress(
+          `PaddleOCR leu “${match.candidate}” e o Scryfall confirmou “${match.card.name}”.`
+        );
       } else {
-        const firstCandidate = originalCandidates[0] ?? attempts[1]?.candidates[0] ?? "";
+        const firstCandidate = allCandidates[0] ?? "";
         setCurrentCard((current) => ({
           ...current,
           photoDataUrl,
-          rawOcrText: originalText,
-          ocrCandidates: Array.from(new Set(attempts.flatMap((attempt) => attempt.candidates))),
+          rawOcrText: defaultAttempt.rawText,
+          ocrCandidates: allCandidates,
           ocrAttempts: attempts,
           matchedCandidate: "",
           cardName: firstCandidate,
           selectedCard: null,
           searching: false,
           error: firstCandidate
-            ? "Não encontramos a carta automaticamente. Corrija o nome ou deixe esta foto pendente."
-            : "Não conseguimos ler o nome. Fotografe novamente, digite o nome ou deixe pendente."
+            ? "O PaddleOCR encontrou textos, mas o Scryfall não confirmou a carta. Escolha uma sugestão, corrija o nome ou deixe pendente."
+            : "O PaddleOCR não encontrou um nome utilizável. Fotografe novamente, digite o nome ou deixe pendente."
         }));
-        setOcrProgress(firstCandidate ? `Primeira linha lida: ${firstCandidate}.` : "Leitura sem resultado confiável.");
+        setOcrProgress(
+          firstCandidate
+            ? `Primeiro candidato: “${firstCandidate}”.`
+            : "Nenhuma linha plausível foi identificada."
+        );
       }
     } catch (caught) {
       setCurrentCard((current) => ({
         ...current,
         photoDataUrl,
-        error: "O OCR não concluiu. Você ainda pode digitar o nome ou deixar a carta pendente."
+        error: "O PaddleOCR não concluiu. Você ainda pode digitar o nome ou deixar a carta pendente."
       }));
-      setError(caught instanceof Error ? caught.message : "O OCR não concluiu.");
+      setError(caught instanceof Error ? caught.message : "O PaddleOCR não concluiu.");
     } finally {
       setOcrRunning(false);
       captureLockRef.current = false;
@@ -944,7 +1154,7 @@ export function CardOrderFlow({
     <div className={containerClass}>
       <header className="scanner-context-bar">
         <div>
-          <small>Scanner contínuo · v4</small>
+          <small>Scanner contínuo · PaddleOCR v5</small>
           <span>{tabLabel ?? "Comanda selecionada"}</span>
           <strong>{selectedFolder?.name ?? "Pasta"}</strong>
         </div>
@@ -982,7 +1192,7 @@ export function CardOrderFlow({
                 onChange={(event) => {
                   setAutoCapture(event.target.checked);
                   setCameraStatus(event.target.checked
-                    ? "Movimente a carta para a moldura. A captura será automática quando ela ficar estável."
+                    ? "Centralize a carta. A captura será automática quando a imagem ficar estável."
                     : "Posicione a carta e toque em Capturar agora."
                   );
                 }}
@@ -1035,7 +1245,7 @@ export function CardOrderFlow({
           <img src={currentCard.photoDataUrl} alt="Carta capturada" />
           <div>
             <LoaderCircle className="spin" size={28} />
-            <strong>Lendo automaticamente</strong>
+            <strong>Lendo com PaddleOCR</strong>
             <span>{ocrProgress || "Extraindo os textos e consultando o Scryfall…"}</span>
           </div>
         </section>
@@ -1150,10 +1360,26 @@ export function CardOrderFlow({
               {currentCard.ocrAttempts.map((attempt, index) => (
                 <div key={`${attempt.source}_${index}`}>
                   <strong>
-                    {attempt.source === "original" ? "Imagem original" : "Tentativa com contraste leve"}
-                    {attempt.confidence !== null ? ` · confiança ${Math.round(attempt.confidence)}%` : ""}
+                    {attempt.source === "paddle-default"
+                      ? "PaddleOCR · leitura padrão da foto original"
+                      : "PaddleOCR · segunda leitura da mesma foto"}
+                    {attempt.confidence !== null ? ` · confiança média ${Math.round(attempt.confidence)}%` : ""}
                   </strong>
+                  {attempt.metrics?.totalMs !== undefined && (
+                    <small>
+                      {Math.round(attempt.metrics.totalMs)} ms · {attempt.metrics.recognizedCount ?? attempt.recognizedLines.length} linhas
+                    </small>
+                  )}
                   <pre>{attempt.rawText || "Nenhum texto extraído."}</pre>
+                  {debugEnabled && attempt.recognizedLines.length > 0 && (
+                    <div className="ocr-position-debug">
+                      {attempt.recognizedLines.map((line, lineIndex) => (
+                        <span key={`${attempt.source}_${lineIndex}_${line.text}`}>
+                          topo {Math.round(line.top * 100)}% · {Math.round(line.score * 100)}% · {line.text}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
               ))}
             </details>

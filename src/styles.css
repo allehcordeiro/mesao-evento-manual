@@ -2218,36 +2218,19 @@ small {
 
 .card-guide {
   position: absolute;
-  inset: 7% 17%;
-  border: 3px solid rgba(255, 255, 255, 0.88);
-  border-radius: 1rem;
-  box-shadow: 0 0 0 999px rgba(0, 0, 0, 0.24);
+  inset: 5%;
+  border-radius: 1.1rem;
   pointer-events: none;
-}
-
-.card-guide::before,
-.card-guide::after {
-  content: "";
-  position: absolute;
-  width: 30px;
-  height: 30px;
-  border-color: #f2bdc5;
-}
-
-.card-guide::before {
-  top: -3px;
-  left: -3px;
-  border-top: 5px solid #f2bdc5;
-  border-left: 5px solid #f2bdc5;
-  border-radius: 0.8rem 0 0 0;
-}
-
-.card-guide::after {
-  right: -3px;
-  bottom: -3px;
-  border-right: 5px solid #f2bdc5;
-  border-bottom: 5px solid #f2bdc5;
-  border-radius: 0 0 0.8rem 0;
+  background:
+    linear-gradient(#f2bdc5, #f2bdc5) left top / 34px 4px no-repeat,
+    linear-gradient(#f2bdc5, #f2bdc5) left top / 4px 34px no-repeat,
+    linear-gradient(#f2bdc5, #f2bdc5) right top / 34px 4px no-repeat,
+    linear-gradient(#f2bdc5, #f2bdc5) right top / 4px 34px no-repeat,
+    linear-gradient(#f2bdc5, #f2bdc5) left bottom / 34px 4px no-repeat,
+    linear-gradient(#f2bdc5, #f2bdc5) left bottom / 4px 34px no-repeat,
+    linear-gradient(#f2bdc5, #f2bdc5) right bottom / 34px 4px no-repeat,
+    linear-gradient(#f2bdc5, #f2bdc5) right bottom / 4px 34px no-repeat;
+  filter: drop-shadow(0 1px 4px rgba(0, 0, 0, 0.28));
 }
 
 .camera-placeholder {
@@ -2650,4 +2633,19 @@ small {
   font-size: 0.7rem;
   font-weight: 850;
   cursor: pointer;
+}
+
+.ocr-position-debug {
+  display: grid;
+  gap: 0.3rem;
+  margin-top: 0.55rem;
+}
+
+.ocr-position-debug span {
+  display: block;
+  padding: 0.35rem 0.45rem;
+  border-radius: 0.45rem;
+  background: rgba(36, 75, 58, 0.07);
+  font-size: 0.72rem;
+  line-height: 1.35;
 }
