@@ -1,16 +1,15 @@
 import {
+  Camera,
   ChefHat,
-  CircleDollarSign,
   ClipboardList,
   LogIn,
   UsersRound
 } from "lucide-react";
 import type { BootstrapData } from "../types";
-import { formatMoney } from "../lib/format";
 
 interface DashboardProps {
   data: BootstrapData;
-  onNavigate: (page: "checkin" | "tabs" | "kitchen") => void;
+  onNavigate: (page: "checkin" | "cards" | "tabs" | "kitchen") => void;
 }
 
 export function Dashboard({ data, onNavigate }: DashboardProps) {
@@ -21,13 +20,13 @@ export function Dashboard({ data, onNavigate }: DashboardProps) {
       <section className="hero-card">
         <div>
           <span className="eyebrow">Evento em andamento</span>
-          <h2>O encontro acontece aqui.</h2>
-          <p>Check-in, consumo e pagamentos em uma jornada rápida.</p>
+          <h2>O balcão acontece aqui.</h2>
+          <p>Acesse rapidamente check-in, cartas, comandas e preparo.</p>
         </div>
         <div className="heart-orbit" aria-hidden="true">♥</div>
       </section>
 
-      <section className="stats-grid" aria-label="Resumo do evento">
+      <section className="stats-grid stats-grid--operational" aria-label="Resumo operacional do evento">
         <article className="stat-card">
           <UsersRound aria-hidden="true" />
           <strong>{stats.presentCount}</strong>
@@ -38,23 +37,11 @@ export function Dashboard({ data, onNavigate }: DashboardProps) {
           <strong>{stats.openTabsCount}</strong>
           <span>Comandas abertas</span>
         </article>
-        <article className="stat-card stat-card--wide">
-          <CircleDollarSign aria-hidden="true" />
-          <div>
-            <strong>{formatMoney(stats.salesCents)}</strong>
-            <span>Consumo registrado</span>
-          </div>
-          <small>{formatMoney(stats.paymentsCents)} recebidos</small>
-        </article>
-        <article className="stat-card stat-card--wide">
+        <article className="stat-card stat-card--operational">
           <ChefHat aria-hidden="true" />
-          <div>
-            <strong>{stats.kitchenPendingCount}</strong>
-            <span>Pedidos em preparo</span>
-          </div>
-          <button className="text-button" onClick={() => onNavigate("kitchen")}>
-            Abrir fila
-          </button>
+          <strong>{stats.kitchenPendingCount}</strong>
+          <span>Pedidos em preparo</span>
+          <button className="text-button" onClick={() => onNavigate("kitchen")}>Abrir fila</button>
         </article>
       </section>
 
@@ -66,8 +53,15 @@ export function Dashboard({ data, onNavigate }: DashboardProps) {
           </div>
         </div>
 
-        <div className="action-grid">
-          <button className="action-card action-card--primary" onClick={() => onNavigate("checkin")}>
+        <div className="action-grid action-grid--four">
+          <button className="action-card action-card--primary" onClick={() => onNavigate("cards")}>
+            <Camera aria-hidden="true" />
+            <span>
+              <strong>Ler cartas</strong>
+              <small>Iniciar uma venda no scanner contínuo</small>
+            </span>
+          </button>
+          <button className="action-card" onClick={() => onNavigate("checkin")}>
             <LogIn aria-hidden="true" />
             <span>
               <strong>Fazer check-in</strong>

@@ -6,9 +6,11 @@ import {
   ImagePlus,
   LoaderCircle,
   Plus,
+  RefreshCw,
   Search,
-  Sparkles,
-  Trash2
+  Settings2,
+  Trash2,
+  Upload
 } from "lucide-react";
 import {
   createCardFolder,
@@ -27,6 +29,7 @@ import { formatMoney } from "../lib/format";
 
 type Finish = CardOrderItemInput["finish"];
 type CardCondition = CardOrderItemInput["condition"];
+type OcrSource = "original" | "fallback";
 
 type OcrWorker = {
   recognize: (
@@ -45,14 +48,24 @@ declare global {
   }
 }
 
+interface OcrAttempt {
+  source: OcrSource;
+  rawText: string;
+  confidence: number | null;
+  candidates: string[];
+}
+
 interface DraftCard {
   key: string;
   rawOcrText: string;
   ocrCandidates: string[];
+  ocrAttempts: OcrAttempt[];
+  matchedCandidate: string;
   cardName: string;
   selectedCard: ScryfallCardOption | null;
   printOptions: ScryfallCardOption[];
   showPrints: boolean;
+  showOptions: boolean;
   quantity: number;
   finish: Finish;
   condition: CardCondition;
@@ -64,8 +77,11 @@ interface DraftCard {
 
 interface CardOrderFlowProps {
   tabId: string;
+  tabLabel?: string;
   busy: boolean;
+  standalone?: boolean;
   onCompleted: (tab: TabDetail) => void;
+  onCancel?: () => void;
 }
 
 const conditions: CardCondition[] = ["NM", "SP", "MP", "HP", "D"];
@@ -80,10 +96,13 @@ function createDraftCard(index: number): DraftCard {
     key: `${Date.now()}_${index}_${Math.random()}`,
     rawOcrText: "",
     ocrCandidates: [],
+    ocrAttempts: [],
+    matchedCandidate: "",
     cardName: "",
     selectedCard: null,
     printOptions: [],
     showPrints: false,
+    showOptions: false,
     quantity: 1,
     finish: "normal",
     condition: "NM",
@@ -119,58 +138,71 @@ function loadImage(source: string): Promise<HTMLImageElement> {
   });
 }
 
+async function resizeWithoutVisualTreatment(
+  source: HTMLImageElement | HTMLVideoElement,
+  sourceWidth: number,
+  sourceHeight: number,
+  maxSide = 1600,
+  quality = 0.9
+): Promise<string> {
+  let scale = Math.min(1, maxSide / Math.max(sourceWidth, sourceHeight));
+  let result = "";
+  let currentQuality = quality;
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+    canvas.height = Math.max(1, Math.round(sourceHeight * scale));
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Seu navegador não conseguiu preparar a fotografia.");
+
+    // A imagem principal é apenas redimensionada/comprimida. Nenhum filtro de
+    // brilho, contraste ou cor é aplicado antes da primeira tentativa do OCR.
+    context.drawImage(source, 0, 0, canvas.width, canvas.height);
+    result = canvas.toDataURL("image/jpeg", currentQuality);
+
+    if (result.length <= 700_000) return result;
+    currentQuality = Math.max(0.5, currentQuality - 0.07);
+    if (attempt >= 3) scale *= 0.9;
+  }
+
+  if (result.length > 780_000) {
+    throw new Error("A fotografia ficou muito grande. Aproxime a carta e tente novamente.");
+  }
+  return result;
+}
+
 async function compressPhoto(file: File): Promise<string> {
   const sourceUrl = URL.createObjectURL(file);
   try {
     const image = await loadImage(sourceUrl);
-    const maxSide = 1400;
-    let scale = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight));
-    let quality = 0.84;
-    let result = "";
-
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-      const context = canvas.getContext("2d");
-      if (!context) throw new Error("Seu navegador não conseguiu preparar a fotografia.");
-      context.drawImage(image, 0, 0, canvas.width, canvas.height);
-      result = canvas.toDataURL("image/jpeg", quality);
-      if (result.length <= 700_000) return result;
-      quality = Math.max(0.48, quality - 0.08);
-      if (attempt >= 4) scale *= 0.88;
-    }
-
-    if (result.length > 780_000) {
-      throw new Error("A fotografia ficou muito grande. Afaste um pouco a câmera e tente novamente.");
-    }
-    return result;
+    return resizeWithoutVisualTreatment(
+      image,
+      image.naturalWidth,
+      image.naturalHeight
+    );
   } finally {
     URL.revokeObjectURL(sourceUrl);
   }
 }
 
-async function prepareFullCardForOcr(photoDataUrl: string): Promise<string> {
+async function prepareFallbackForOcr(photoDataUrl: string): Promise<string> {
   const image = await loadImage(photoDataUrl);
-
-  // O Tesseract recebe a carta inteira. A ordem natural da leitura (topo para
-  // baixo) é usada para considerar o título como o primeiro texto plausível.
   const minimumWidth = 1500;
   const scale = image.naturalWidth < minimumWidth
-    ? Math.min(2.4, minimumWidth / Math.max(1, image.naturalWidth))
+    ? Math.min(2, minimumWidth / Math.max(1, image.naturalWidth))
     : 1;
 
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
   canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
   const context = canvas.getContext("2d");
-  if (!context) throw new Error("Não foi possível preparar a fotografia para leitura.");
+  if (!context) throw new Error("Não foi possível preparar a tentativa alternativa do OCR.");
 
-  // Um tratamento moderado conserva tanto o título quanto os demais textos.
-  // Exagerar no contraste pode apagar letras claras ou textos de cartas antigas.
-  context.filter = "grayscale(1) contrast(1.28) brightness(1.04)";
+  // O tratamento só é usado como contingência, depois que a imagem original
+  // falha. Não aumentamos o brilho para não apagar letras em molduras claras.
+  context.filter = "grayscale(1) contrast(1.16)";
   context.drawImage(image, 0, 0, canvas.width, canvas.height);
-
   return canvas.toDataURL("image/png");
 }
 
@@ -182,6 +214,19 @@ function normalizeOcrLine(line: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 100);
+}
+
+function candidateVariants(line: string): string[] {
+  const variants = [line];
+  const withoutTrailingMana = line
+    .replace(/\s+(?:\d+\s*)?(?:[WUBRGCXYZ]\s*){1,4}$/i, "")
+    .replace(/\s+\d{1,3}$/i, "")
+    .trim();
+
+  if (withoutTrailingMana.length >= 2 && withoutTrailingMana !== line) {
+    variants.push(withoutTrailingMana);
+  }
+  return variants;
 }
 
 function extractOcrCandidates(text: string): string[] {
@@ -196,27 +241,26 @@ function extractOcrCandidates(text: string): string[] {
     const oneCharacterWords = words.filter((word) => word.length === 1).length;
     const letterCount = (line.match(/[A-Za-zÀ-ÿ]/g) ?? []).length;
 
-    // Descarta linhas que são predominantemente símbolos/letras isoladas, um
-    // padrão comum na leitura de ícones, custo de mana e moldura da carta.
     if (words.length >= 3 && oneCharacterWords >= Math.ceil(words.length / 2)) continue;
-    if (letterCount < Math.max(2, Math.floor(line.length * 0.45))) continue;
+    if (letterCount < Math.max(2, Math.floor(line.length * 0.42))) continue;
     if (/^(copyright|illustrated by|artist|collector|wizards of the coast)$/i.test(line)) continue;
 
-    const key = line.toLocaleLowerCase("en-US");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    candidates.push(line);
-
-    // O título está no topo. Limitar as tentativas evita que um trecho longo das
-    // regras seja confundido com o nome de outra carta real.
-    if (candidates.length >= 8) break;
+    for (const variant of candidateVariants(line)) {
+      const key = variant.toLocaleLowerCase("en-US");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push(variant);
+      if (candidates.length >= 10) return candidates;
+    }
   }
 
   return candidates;
 }
 
 async function composeOrderPhoto(cards: DraftCard[]): Promise<string | null> {
-  const photos = cards.map((card) => card.photoDataUrl).filter((value): value is string => Boolean(value));
+  const photos = cards
+    .map((card) => card.photoDataUrl)
+    .filter((value): value is string => Boolean(value));
   if (photos.length === 0) return null;
   if (photos.length === 1) return photos[0];
 
@@ -257,24 +301,46 @@ async function composeOrderPhoto(cards: DraftCard[]): Promise<string | null> {
   return result;
 }
 
-export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) {
+export function CardOrderFlow({
+  tabId,
+  tabLabel,
+  busy,
+  standalone = false,
+  onCompleted,
+  onCancel
+}: CardOrderFlowProps) {
   const [folders, setFolders] = useState<CardFolder[]>([]);
   const [folderId, setFolderId] = useState("");
   const [newFolderName, setNewFolderName] = useState("");
   const [confirmedCards, setConfirmedCards] = useState<DraftCard[]>([]);
+  const [pendingCards, setPendingCards] = useState<DraftCard[]>([]);
   const [currentCard, setCurrentCard] = useState<DraftCard>(() => createDraftCard(0));
   const [loadingFolders, setLoadingFolders] = useState(true);
   const [creatingFolder, setCreatingFolder] = useState(false);
+  const [flowStarted, setFlowStarted] = useState(false);
+  const [cameraActive, setCameraActive] = useState(false);
+  const [cameraError, setCameraError] = useState("");
+  const [cameraStatus, setCameraStatus] = useState("Posicione uma carta dentro da moldura.");
+  const [autoCapture, setAutoCapture] = useState(true);
   const [ocrRunning, setOcrRunning] = useState(false);
   const [ocrProgress, setOcrProgress] = useState("");
   const [saving, setSaving] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
   const [error, setError] = useState("");
-  const ocrWorkerRef = useRef<OcrWorker | null>(null);
 
-  useEffect(() => () => {
-    ocrWorkerRef.current?.terminate().catch(() => undefined);
-    ocrWorkerRef.current = null;
-  }, []);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const monitorRafRef = useRef<number | null>(null);
+  const captureLockRef = useRef(false);
+  const ocrWorkerRef = useRef<OcrWorker | null>(null);
+  const priceInputRef = useRef<HTMLInputElement | null>(null);
+  const awaitingPriceFocusRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const debugEnabled = useMemo(
+    () => new URLSearchParams(window.location.search).get("cardDebug") === "1",
+    []
+  );
 
   useEffect(() => {
     listCardFolders()
@@ -286,12 +352,48 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
       .finally(() => setLoadingFolders(false));
   }, []);
 
+  useEffect(() => {
+    const focusPriceAfterReturn = () => {
+      if (document.visibilityState === "visible" && awaitingPriceFocusRef.current) {
+        awaitingPriceFocusRef.current = false;
+        window.setTimeout(() => priceInputRef.current?.focus(), 220);
+      }
+    };
+    document.addEventListener("visibilitychange", focusPriceAfterReturn);
+    return () => document.removeEventListener("visibilitychange", focusPriceAfterReturn);
+  }, []);
+
+  useEffect(() => () => {
+    if (monitorRafRef.current !== null) cancelAnimationFrame(monitorRafRef.current);
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    ocrWorkerRef.current?.terminate().catch(() => undefined);
+    streamRef.current = null;
+    ocrWorkerRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (!flowStarted || streamRef.current) return;
+    const timer = window.setTimeout(() => void startCamera(), 0);
+    return () => window.clearTimeout(timer);
+  }, [flowStarted]);
+
+  useEffect(() => {
+    if (
+      !flowStarted ||
+      currentCard.photoDataUrl ||
+      !streamRef.current ||
+      !videoRef.current
+    ) return;
+
+    videoRef.current.srcObject = streamRef.current;
+    void videoRef.current.play().catch(() => undefined);
+  }, [cameraActive, currentCard.photoDataUrl, flowStarted]);
+
   const totalCents = useMemo(
-    () =>
-      confirmedCards.reduce((total, card) => {
-        const cents = parseMoneyToCents(card.priceText);
-        return total + (cents >= 0 ? cents * card.quantity : 0);
-      }, 0),
+    () => confirmedCards.reduce((total, card) => {
+      const cents = parseMoneyToCents(card.priceText);
+      return total + (cents >= 0 ? cents * card.quantity : 0);
+    }, 0),
     [confirmedCards]
   );
 
@@ -304,25 +406,294 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
     setCurrentCard((current) => ({ ...current, ...patch }));
   }
 
-  async function handlePhoto(file: File | undefined) {
-    if (!file) return;
-    setError("");
-    setOcrProgress("");
+  async function startCamera() {
+    setCameraError("");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraError("A câmera contínua não está disponível neste navegador. Use o envio de fotografia.");
+      return;
+    }
+
     try {
-      const photoDataUrl = await compressPhoto(file);
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      setCameraActive(true);
+      setCameraStatus(autoCapture
+        ? "Movimente a carta para a moldura. A captura será automática quando ela ficar estável."
+        : "Posicione a carta e toque em Capturar agora."
+      );
+    } catch {
+      setCameraActive(false);
+      setCameraError("Não foi possível abrir a câmera. Confira a permissão ou escolha uma foto.");
+    }
+  }
+
+  function stopCamera() {
+    if (monitorRafRef.current !== null) cancelAnimationFrame(monitorRafRef.current);
+    monitorRafRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setCameraActive(false);
+  }
+
+  async function getOcrWorker(): Promise<OcrWorker> {
+    if (ocrWorkerRef.current) return ocrWorkerRef.current;
+    if (!window.Tesseract) {
+      throw new Error("O OCR não carregou. Digite o nome manualmente.");
+    }
+
+    setOcrProgress("Carregando o leitor de texto…");
+    const worker = await window.Tesseract.createWorker("eng");
+    await worker.setParameters({
+      tessedit_pageseg_mode: "3",
+      preserve_interword_spaces: "1"
+    });
+    ocrWorkerRef.current = worker;
+    return worker;
+  }
+
+  async function findScryfallMatch(candidates: string[]) {
+    for (const candidate of candidates.slice(0, 10)) {
+      setOcrProgress(`Conferindo “${candidate}” no Scryfall…`);
+      try {
+        return {
+          card: await resolveScryfallCard(candidate),
+          candidate
+        };
+      } catch {
+        // A próxima linha plausível será tentada automaticamente.
+      }
+    }
+    return null;
+  }
+
+  async function analyzePhoto(photoDataUrl: string) {
+    setOcrRunning(true);
+    setError("");
+    setCurrentCard((current) => ({
+      ...current,
+      photoDataUrl,
+      rawOcrText: "",
+      ocrCandidates: [],
+      ocrAttempts: [],
+      matchedCandidate: "",
+      cardName: "",
+      selectedCard: null,
+      printOptions: [],
+      showPrints: false,
+      error: ""
+    }));
+
+    try {
+      const worker = await getOcrWorker();
+      setOcrProgress("Lendo a imagem original…");
+      const original = await worker.recognize(photoDataUrl);
+      const originalText = original.data.text.trim();
+      const originalCandidates = extractOcrCandidates(originalText);
+      const attempts: OcrAttempt[] = [{
+        source: "original",
+        rawText: originalText,
+        confidence: original.data.confidence ?? null,
+        candidates: originalCandidates
+      }];
+
+      let match = await findScryfallMatch(originalCandidates);
+      let chosenAttempt = attempts[0];
+
+      if (!match) {
+        setOcrProgress("A leitura original não encontrou a carta. Tentando contraste leve…");
+        const fallbackImage = await prepareFallbackForOcr(photoDataUrl);
+        const fallback = await worker.recognize(fallbackImage);
+        const fallbackText = fallback.data.text.trim();
+        const fallbackCandidates = extractOcrCandidates(fallbackText);
+        const fallbackAttempt: OcrAttempt = {
+          source: "fallback",
+          rawText: fallbackText,
+          confidence: fallback.data.confidence ?? null,
+          candidates: fallbackCandidates
+        };
+        attempts.push(fallbackAttempt);
+        match = await findScryfallMatch(fallbackCandidates);
+        chosenAttempt = match ? fallbackAttempt : attempts[0];
+      }
+
+      if (match) {
+        setCurrentCard((current) => ({
+          ...current,
+          photoDataUrl,
+          rawOcrText: chosenAttempt.rawText,
+          ocrCandidates: chosenAttempt.candidates,
+          ocrAttempts: attempts,
+          matchedCandidate: match.candidate,
+          cardName: match.card.name,
+          selectedCard: match.card,
+          printOptions: [],
+          showPrints: false,
+          searching: false,
+          error: ""
+        }));
+        setOcrProgress(`Encontramos “${match.card.name}”. Confira a imagem e informe o preço.`);
+      } else {
+        const firstCandidate = originalCandidates[0] ?? attempts[1]?.candidates[0] ?? "";
+        setCurrentCard((current) => ({
+          ...current,
+          photoDataUrl,
+          rawOcrText: originalText,
+          ocrCandidates: Array.from(new Set(attempts.flatMap((attempt) => attempt.candidates))),
+          ocrAttempts: attempts,
+          matchedCandidate: "",
+          cardName: firstCandidate,
+          selectedCard: null,
+          searching: false,
+          error: firstCandidate
+            ? "Não encontramos a carta automaticamente. Corrija o nome ou deixe esta foto pendente."
+            : "Não conseguimos ler o nome. Fotografe novamente, digite o nome ou deixe pendente."
+        }));
+        setOcrProgress(firstCandidate ? `Primeira linha lida: ${firstCandidate}.` : "Leitura sem resultado confiável.");
+      }
+    } catch (caught) {
       setCurrentCard((current) => ({
         ...current,
         photoDataUrl,
-        rawOcrText: "",
-        ocrCandidates: [],
-        cardName: "",
-        selectedCard: null,
-        printOptions: [],
-        showPrints: false,
-        error: ""
+        error: "O OCR não concluiu. Você ainda pode digitar o nome ou deixar a carta pendente."
       }));
+      setError(caught instanceof Error ? caught.message : "O OCR não concluiu.");
+    } finally {
+      setOcrRunning(false);
+      captureLockRef.current = false;
+    }
+  }
+
+  async function captureFromVideo() {
+    if (captureLockRef.current || ocrRunning || currentCard.photoDataUrl) return;
+    const video = videoRef.current;
+    if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
+
+    captureLockRef.current = true;
+    setCameraStatus("Fotografia capturada. Lendo automaticamente…");
+    try {
+      const photoDataUrl = await resizeWithoutVisualTreatment(
+        video,
+        video.videoWidth,
+        video.videoHeight
+      );
+      await analyzePhoto(photoDataUrl);
     } catch (caught) {
+      captureLockRef.current = false;
+      setError(caught instanceof Error ? caught.message : "Não foi possível capturar a carta.");
+    }
+  }
+
+  useEffect(() => {
+    if (
+      !flowStarted ||
+      !cameraActive ||
+      !autoCapture ||
+      currentCard.photoDataUrl ||
+      ocrRunning
+    ) {
+      if (monitorRafRef.current !== null) cancelAnimationFrame(monitorRafRef.current);
+      monitorRafRef.current = null;
+      return;
+    }
+
+    const sampleCanvas = document.createElement("canvas");
+    sampleCanvas.width = 48;
+    sampleCanvas.height = 64;
+    const sampleContext = sampleCanvas.getContext("2d", { willReadFrequently: true });
+    if (!sampleContext) return;
+
+    let previous: Uint8ClampedArray | null = null;
+    let motionSeen = false;
+    let stableSince = 0;
+    let lastSampleAt = 0;
+    let stopped = false;
+    const warmupUntil = performance.now() + 1600;
+
+    const monitor = (timestamp: number) => {
+      if (stopped) return;
+      const video = videoRef.current;
+
+      if (video && video.readyState >= 2 && timestamp - lastSampleAt >= 120) {
+        lastSampleAt = timestamp;
+        sampleContext.drawImage(video, 0, 0, sampleCanvas.width, sampleCanvas.height);
+        const pixels = sampleContext.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height).data;
+        const grayscale = new Uint8ClampedArray(sampleCanvas.width * sampleCanvas.height);
+
+        for (let pixel = 0, sample = 0; pixel < pixels.length; pixel += 4, sample += 1) {
+          grayscale[sample] = Math.round(
+            pixels[pixel] * 0.299 + pixels[pixel + 1] * 0.587 + pixels[pixel + 2] * 0.114
+          );
+        }
+
+        if (timestamp < warmupUntil) {
+          previous = grayscale;
+          setCameraStatus("Preparando a câmera…");
+          monitorRafRef.current = requestAnimationFrame(monitor);
+          return;
+        }
+
+        if (previous) {
+          let difference = 0;
+          for (let index = 0; index < grayscale.length; index += 1) {
+            difference += Math.abs(grayscale[index] - previous[index]);
+          }
+          difference /= grayscale.length;
+
+          if (difference > 6) {
+            motionSeen = true;
+            stableSince = 0;
+            setCameraStatus("Carta detectada. Mantenha firme…");
+          } else if (motionSeen && difference < 2.2) {
+            if (!stableSince) stableSince = timestamp;
+            const elapsed = timestamp - stableSince;
+            setCameraStatus(elapsed > 450 ? "Capturando…" : "Mantenha firme…");
+            if (elapsed >= 850) {
+              stopped = true;
+              void captureFromVideo();
+              return;
+            }
+          } else if (motionSeen) {
+            stableSince = 0;
+          }
+        }
+        previous = grayscale;
+      }
+      monitorRafRef.current = requestAnimationFrame(monitor);
+    };
+
+    monitorRafRef.current = requestAnimationFrame(monitor);
+    return () => {
+      stopped = true;
+      if (monitorRafRef.current !== null) cancelAnimationFrame(monitorRafRef.current);
+      monitorRafRef.current = null;
+    };
+  }, [autoCapture, cameraActive, currentCard.photoDataUrl, flowStarted, ocrRunning]);
+
+  async function handleFilePhoto(file: File | undefined) {
+    if (!file) return;
+    setError("");
+    captureLockRef.current = true;
+    try {
+      const photoDataUrl = await compressPhoto(file);
+      await analyzePhoto(photoDataUrl);
+    } catch (caught) {
+      captureLockRef.current = false;
       setError(caught instanceof Error ? caught.message : "Não foi possível preparar a fotografia.");
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
 
@@ -360,8 +731,10 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
         cardName: result.name,
         selectedCard: result,
         printOptions: [],
-        showPrints: false
+        showPrints: false,
+        error: ""
       });
+      setOcrProgress(`Carta definida como “${result.name}”.`);
     } catch (caught) {
       updateCurrentCard({
         searching: false,
@@ -376,11 +749,7 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
     updateCurrentCard({ searching: true, error: "" });
     try {
       const prints = await listScryfallPrints(currentCard.cardName);
-      updateCurrentCard({
-        searching: false,
-        printOptions: prints,
-        showPrints: true
-      });
+      updateCurrentCard({ searching: false, printOptions: prints, showPrints: true });
     } catch (caught) {
       updateCurrentCard({
         searching: false,
@@ -389,103 +758,15 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
     }
   }
 
-  async function getOcrWorker(): Promise<OcrWorker> {
-    if (ocrWorkerRef.current) return ocrWorkerRef.current;
-    if (!window.Tesseract) {
-      throw new Error("O OCR não carregou. Digite o nome manualmente.");
-    }
-
-    setOcrProgress("Carregando o leitor de texto…");
-    const worker = await window.Tesseract.createWorker("eng");
-    await worker.setParameters({
-      tessedit_pageseg_mode: "3",
-      preserve_interword_spaces: "1"
-    });
-    ocrWorkerRef.current = worker;
-    return worker;
-  }
-
-  async function runOcr() {
-    if (!currentCard.photoDataUrl) {
-      setError("Fotografe a carta antes de iniciar a leitura.");
-      return;
-    }
-
-    setOcrRunning(true);
-    setError("");
-    updateCurrentCard({ error: "" });
-    try {
-      const worker = await getOcrWorker();
-      setOcrProgress("Lendo todos os textos da carta…");
-      const preparedImage = await prepareFullCardForOcr(currentCard.photoDataUrl);
-      const result = await worker.recognize(preparedImage);
-      const rawText = result.data.text.trim();
-      const candidates = extractOcrCandidates(rawText);
-      const firstCandidate = candidates[0] ?? "";
-
-      updateCurrentCard({
-        rawOcrText: rawText,
-        ocrCandidates: candidates,
-        cardName: firstCandidate,
-        selectedCard: null,
-        printOptions: [],
-        showPrints: false,
-        error: firstCandidate ? "" : "Não foi possível localizar uma primeira linha legível. Digite o nome manualmente."
-      });
-
-      if (!firstCandidate) {
-        setOcrProgress("Não conseguimos ler uma linha utilizável. Digite o nome manualmente.");
-        return;
-      }
-
-      let matchedCard: ScryfallCardOption | null = null;
-      let matchedCandidate = "";
-
-      // A primeira linha é sempre tentada primeiro. As seguintes funcionam como
-      // contingência para casos em que o OCR produziu um pequeno ruído acima do título.
-      for (const candidate of candidates) {
-        setOcrProgress(`Conferindo “${candidate}” no Scryfall…`);
-        try {
-          matchedCard = await resolveScryfallCard(candidate);
-          matchedCandidate = candidate;
-          break;
-        } catch {
-          // Tenta a próxima linha plausível. O erro final é exibido abaixo.
-        }
-      }
-
-      if (matchedCard) {
-        updateCurrentCard({
-          rawOcrText: rawText,
-          ocrCandidates: candidates,
-          cardName: matchedCard.name,
-          selectedCard: matchedCard,
-          printOptions: [],
-          showPrints: false,
-          searching: false,
-          error: ""
-        });
-        setOcrProgress(`O OCR sugeriu “${matchedCandidate}”. Confirme a carta e a edição.`);
-      } else {
-        updateCurrentCard({
-          rawOcrText: rawText,
-          ocrCandidates: candidates,
-          cardName: firstCandidate,
-          selectedCard: null,
-          searching: false,
-          error: "O Scryfall não reconheceu as primeiras linhas. Corrija o nome ou escolha outro candidato abaixo."
-        });
-        setOcrProgress(`Primeira linha lida: ${firstCandidate}.`);
-      }
-    } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? `O OCR não concluiu: ${caught.message}`
-          : "O OCR não concluiu. Digite o nome manualmente."
-      );
-    } finally {
-      setOcrRunning(false);
-    }
+  function resetForNextCard() {
+    setCurrentCard(createDraftCard(confirmedCards.length + pendingCards.length + 1));
+    setOcrProgress("");
+    setReviewOpen(false);
+    captureLockRef.current = false;
+    setCameraStatus(autoCapture
+      ? "Retire a carta anterior e posicione a próxima. A captura será automática."
+      : "Posicione a próxima carta e toque em Capturar agora."
+    );
   }
 
   function confirmAndNext() {
@@ -506,14 +787,47 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
     }
 
     setConfirmedCards((current) => [...current, currentCard]);
-    setCurrentCard(createDraftCard(confirmedCards.length + 1));
-    setOcrProgress("");
+    resetForNextCard();
+  }
+
+  function deferCurrentCard() {
+    if (!currentCard.photoDataUrl) return;
+    setPendingCards((current) => [...current, currentCard]);
+    resetForNextCard();
+  }
+
+  function editConfirmed(card: DraftCard) {
+    setConfirmedCards((current) => current.filter((item) => item.key !== card.key));
+    setCurrentCard({ ...card, error: "" });
+    setReviewOpen(false);
+    setOcrProgress("Edite a carta e confirme novamente.");
+  }
+
+  function reviewPending(card: DraftCard) {
+    setPendingCards((current) => current.filter((item) => item.key !== card.key));
+    setCurrentCard({ ...card, error: card.error || "Revise o nome desta carta." });
+    setReviewOpen(false);
+    setOcrProgress("Pendência aberta para revisão.");
+  }
+
+  async function beginFlow() {
+    if (!folderId) {
+      setError("Selecione a pasta antes de iniciar a leitura.");
+      return;
+    }
+    setError("");
+    setFlowStarted(true);
   }
 
   async function finalize() {
     setError("");
     if (!folderId) {
       setError("Selecione a pasta das cartas.");
+      return;
+    }
+    if (pendingCards.length > 0) {
+      setReviewOpen(true);
+      setError("Resolva ou remova as cartas pendentes antes de finalizar.");
       return;
     }
     if (confirmedCards.length === 0) {
@@ -542,11 +856,8 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
     setSaving(true);
     try {
       const photoDataUrl = await composeOrderPhoto(confirmedCards);
-      const updated = await createCardOrder(tabId, {
-        folderId,
-        photoDataUrl,
-        items
-      });
+      const updated = await createCardOrder(tabId, { folderId, photoDataUrl, items });
+      stopCamera();
       onCompleted(updated);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Não foi possível adicionar as cartas.");
@@ -555,253 +866,417 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
     }
   }
 
-  return (
-    <div className="drawer-scroll card-order-flow">
-      <div className="card-flow-version" role="status">Leitura individual · versão 2</div>
-      {error && <div className="inline-error">{error}</div>}
+  const selectedFolder = folders.find((folder) => folder.id === folderId);
+  const currentPriceCents = parseMoneyToCents(currentCard.priceText);
+  const containerClass = standalone
+    ? "card-order-flow card-order-flow--standalone"
+    : "drawer-scroll card-order-flow";
 
-      <section className="card-step">
-        <span className="eyebrow">1. Origem</span>
-        <h3>De qual pasta saíram?</h3>
-        <label className="field">
-          <span>Pasta</span>
-          <select
-            value={folderId}
-            disabled={loadingFolders}
-            onChange={(event) => setFolderId(event.target.value)}
-          >
-            {loadingFolders && <option>Carregando…</option>}
-            {!loadingFolders && folders.length === 0 && <option value="">Cadastre uma pasta</option>}
-            {folders.map((folder) => (
-              <option key={folder.id} value={folder.id}>
-                {folder.code} · {folder.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <div className="folder-create-row">
-          <input
-            value={newFolderName}
-            onChange={(event) => setNewFolderName(event.target.value)}
-            placeholder="Nova pasta, por exemplo Multicoloridas"
-          />
+  if (!flowStarted) {
+    return (
+      <div className={containerClass}>
+        {error && <div className="inline-error">{error}</div>}
+        <section className="card-setup-card">
+          <div className="scanner-version">Scanner contínuo · versão 4</div>
+          <span className="eyebrow">Venda de cartas</span>
+          <h2>Prepare o atendimento</h2>
+          <p>
+            Confirme a comanda e escolha a pasta uma única vez. Depois disso, a câmera permanece aberta até o lote terminar.
+          </p>
+
+          {tabLabel && (
+            <div className="card-context-choice">
+              <span>Comanda</span>
+              <strong>{tabLabel}</strong>
+            </div>
+          )}
+
+          <label className="field">
+            <span>Pasta de origem</span>
+            <select
+              value={folderId}
+              disabled={loadingFolders}
+              onChange={(event) => setFolderId(event.target.value)}
+            >
+              {loadingFolders && <option>Carregando…</option>}
+              {!loadingFolders && folders.length === 0 && <option value="">Cadastre uma pasta</option>}
+              {folders.map((folder) => (
+                <option key={folder.id} value={folder.id}>
+                  {folder.code} · {folder.name}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <details className="secondary-settings">
+            <summary>Cadastrar outra pasta</summary>
+            <div className="folder-create-row">
+              <input
+                value={newFolderName}
+                onChange={(event) => setNewFolderName(event.target.value)}
+                placeholder="Ex.: Multicoloridas"
+              />
+              <button
+                type="button"
+                className="button button--compact"
+                disabled={creatingFolder || newFolderName.trim().length < 2}
+                onClick={addFolder}
+              >
+                <Plus size={16} /> {creatingFolder ? "Salvando…" : "Criar"}
+              </button>
+            </div>
+          </details>
+
+          <button className="button button--primary button--full" onClick={beginFlow} disabled={!folderId}>
+            <Camera size={18} /> Iniciar leitura contínua
+          </button>
+          {onCancel && (
+            <button type="button" className="text-button card-cancel-link" onClick={onCancel}>
+              Cancelar
+            </button>
+          )}
+        </section>
+      </div>
+    );
+  }
+
+  return (
+    <div className={containerClass}>
+      <header className="scanner-context-bar">
+        <div>
+          <small>Scanner contínuo · v4</small>
+          <span>{tabLabel ?? "Comanda selecionada"}</span>
+          <strong>{selectedFolder?.name ?? "Pasta"}</strong>
+        </div>
+        <div>
+          <span>{confirmedQuantity} cartas</span>
+          <strong>{formatMoney(totalCents)}</strong>
+        </div>
+        {onCancel && (
           <button
             type="button"
-            className="button button--compact"
-            disabled={creatingFolder || newFolderName.trim().length < 2}
-            onClick={addFolder}
+            className="scanner-exit-button"
+            onClick={() => {
+              stopCamera();
+              onCancel();
+            }}
           >
-            <Plus size={16} /> {creatingFolder ? "Salvando…" : "Criar"}
+            Sair
           </button>
-        </div>
-      </section>
+        )}
+      </header>
 
-      <section className="card-step">
-        <span className="eyebrow">2. Carta {confirmedCards.length + 1}</span>
-        <h3>Fotografe uma carta</h3>
-        <p className="card-help">
-          Preencha quase toda a tela com uma única carta, mantendo o nome visível e evitando reflexos.
-        </p>
+      {error && <div className="inline-error">{error}</div>}
 
-        <label className="photo-picker photo-picker--single">
-          {currentCard.photoDataUrl ? (
-            <img src={currentCard.photoDataUrl} alt="Carta fotografada" />
-          ) : (
-            <Camera aria-hidden="true" />
-          )}
-          <span>{currentCard.photoDataUrl ? "Fotografar novamente" : "Fotografar carta"}</span>
-          <input
-            type="file"
-            accept="image/jpeg,image/png,image/webp"
-            capture="environment"
-            onChange={(event) => handlePhoto(event.target.files?.[0])}
-          />
-        </label>
+      {!currentCard.photoDataUrl && !ocrRunning && (
+        <section className="scanner-camera-card">
+          <div className="scanner-title-row">
+            <div>
+              <span className="eyebrow">Carta {confirmedCards.length + pendingCards.length + 1}</span>
+              <h2>Posicione a carta</h2>
+            </div>
+            <label className="auto-capture-toggle">
+              <input
+                type="checkbox"
+                checked={autoCapture}
+                onChange={(event) => {
+                  setAutoCapture(event.target.checked);
+                  setCameraStatus(event.target.checked
+                    ? "Movimente a carta para a moldura. A captura será automática quando ela ficar estável."
+                    : "Posicione a carta e toque em Capturar agora."
+                  );
+                }}
+              />
+              Automático
+            </label>
+          </div>
 
-        <button
-          type="button"
-          className="button button--full"
-          disabled={!currentCard.photoDataUrl || ocrRunning}
-          onClick={runOcr}
-        >
-          {ocrRunning ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}
-          {ocrRunning ? "Lendo nome…" : "Ler nome da carta"}
-        </button>
-        {ocrProgress && <small className="field-hint">{ocrProgress}</small>}
-
-        {currentCard.rawOcrText && (
-          <details className="ocr-reading-details">
-            <summary>Ver leitura completa do OCR</summary>
-            {currentCard.ocrCandidates.length > 0 && (
-              <div className="ocr-candidate-list">
-                <span>Linhas testadas, na ordem:</span>
-                {currentCard.ocrCandidates.map((candidate, index) => (
-                  <button
-                    type="button"
-                    key={`${candidate}_${index}`}
-                    onClick={() => {
-                      updateCurrentCard({ cardName: candidate, selectedCard: null, error: "" });
-                      void searchCurrentCard(candidate);
-                    }}
-                  >
-                    {index + 1}. {candidate}
-                  </button>
-                ))}
+          <div className="live-camera-frame">
+            <video ref={videoRef} autoPlay muted playsInline />
+            <div className="card-guide" aria-hidden="true" />
+            {!cameraActive && (
+              <div className="camera-placeholder">
+                <Camera size={34} />
+                <span>Câmera não iniciada</span>
               </div>
             )}
-            <pre>{currentCard.rawOcrText}</pre>
-          </details>
-        )}
-      </section>
+          </div>
 
-      <section className="card-step">
-        <span className="eyebrow">3. Conferência</span>
-        <h3>Confirme a carta e informe o preço</h3>
+          <p className="camera-status">{cameraStatus}</p>
+          {cameraError && <small className="card-error">{cameraError}</small>}
 
-        <article className="card-draft card-draft--current">
-          {currentCard.selectedCard?.imageUrl ? (
-            <img className="card-thumb" src={currentCard.selectedCard.imageUrl} alt="" />
-          ) : (
-            <div className="card-thumb card-thumb--empty"><ImagePlus size={22} /></div>
+          <div className="scanner-capture-actions">
+            {!cameraActive ? (
+              <button className="button button--primary" onClick={startCamera}>
+                <Camera size={18} /> Abrir câmera
+              </button>
+            ) : (
+              <button className="button button--primary" onClick={() => void captureFromVideo()}>
+                <Camera size={18} /> Capturar agora
+              </button>
+            )}
+            <button className="button" onClick={() => fileInputRef.current?.click()}>
+              <Upload size={18} /> Escolher foto
+            </button>
+            <input
+              ref={fileInputRef}
+              className="visually-hidden"
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              capture="environment"
+              onChange={(event) => void handleFilePhoto(event.target.files?.[0])}
+            />
+          </div>
+        </section>
+      )}
+
+      {ocrRunning && currentCard.photoDataUrl && (
+        <section className="scanner-processing-card">
+          <img src={currentCard.photoDataUrl} alt="Carta capturada" />
+          <div>
+            <LoaderCircle className="spin" size={28} />
+            <strong>Lendo automaticamente</strong>
+            <span>{ocrProgress || "Extraindo os textos e consultando o Scryfall…"}</span>
+          </div>
+        </section>
+      )}
+
+      {currentCard.photoDataUrl && !ocrRunning && (
+        <section className="scanner-result-card">
+          <div className="scanner-title-row">
+            <div>
+              <span className="eyebrow">Conferência</span>
+              <h2>{currentCard.selectedCard ? "Confira e informe o preço" : "Revise a identificação"}</h2>
+            </div>
+            <button type="button" className="text-button" onClick={resetForNextCard}>
+              Fotografar novamente
+            </button>
+          </div>
+
+          <div className="recognition-comparison">
+            <figure>
+              <img src={currentCard.photoDataUrl} alt="Fotografia original" />
+              <figcaption>Foto original</figcaption>
+            </figure>
+            <figure>
+              {currentCard.selectedCard?.imageUrl ? (
+                <img src={currentCard.selectedCard.imageUrl} alt={currentCard.selectedCard.name} />
+              ) : (
+                <div className="card-result-placeholder"><ImagePlus size={26} /></div>
+              )}
+              <figcaption>{currentCard.selectedCard ? "Scryfall" : "Aguardando confirmação"}</figcaption>
+            </figure>
+          </div>
+
+          <label className="field">
+            <span>Nome da carta</span>
+            <div className="card-search-row">
+              <input
+                value={currentCard.cardName}
+                onChange={(event) => updateCurrentCard({
+                  cardName: event.target.value,
+                  selectedCard: null,
+                  error: ""
+                })}
+                placeholder="Digite ou corrija o nome"
+              />
+              <button
+                type="button"
+                className="icon-button"
+                disabled={currentCard.searching || currentCard.cardName.trim().length < 2}
+                aria-label="Buscar no Scryfall"
+                onClick={() => void searchCurrentCard()}
+              >
+                {currentCard.searching ? <LoaderCircle className="spin" size={18} /> : <Search size={18} />}
+              </button>
+            </div>
+          </label>
+
+          {currentCard.selectedCard && (
+            <div className="recognized-card-banner">
+              <Check size={18} />
+              <div>
+                <strong>{currentCard.selectedCard.name}</strong>
+                <span>{currentCard.selectedCard.setName} · #{currentCard.selectedCard.collectorNumber}</span>
+              </div>
+              <button type="button" onClick={() => void openPrints()}>Trocar edição</button>
+            </div>
           )}
 
-          <div className="card-draft__body">
-            <label className="field field--compact">
-              <span>Nome da carta</span>
-              <div className="card-search-row">
-                <input
-                  value={currentCard.cardName}
-                  onChange={(event) => updateCurrentCard({
-                    cardName: event.target.value,
-                    selectedCard: null,
-                    error: ""
-                  })}
-                  placeholder="Digite ou confira o nome"
-                />
+          {currentCard.showPrints && (
+            <div className="print-picker print-picker--large">
+              {currentCard.printOptions.map((option) => (
                 <button
                   type="button"
-                  className="icon-button"
-                  disabled={currentCard.searching || currentCard.cardName.trim().length < 2}
-                  aria-label="Buscar no Scryfall"
-                  onClick={() => searchCurrentCard()}
+                  key={option.id}
+                  className={currentCard.selectedCard?.id === option.id ? "selected" : ""}
+                  onClick={() => updateCurrentCard({
+                    selectedCard: option,
+                    cardName: option.name,
+                    showPrints: false,
+                    error: ""
+                  })}
                 >
-                  {currentCard.searching ? <LoaderCircle className="spin" size={18} /> : <Search size={18} />}
+                  {option.imageUrl ? <img src={option.imageUrl} alt="" /> : <span>Sem imagem</span>}
+                  <small>{option.setCode.toUpperCase()} · #{option.collectorNumber}</small>
                 </button>
-              </div>
-            </label>
+              ))}
+            </div>
+          )}
 
-            {currentCard.selectedCard && (
-              <div className="card-match">
-                <Check size={15} />
-                <span>
-                  {currentCard.selectedCard.setName} · #{currentCard.selectedCard.collectorNumber}
-                </span>
-                <button type="button" onClick={openPrints}>Trocar edição</button>
-              </div>
-            )}
+          {currentCard.error && <small className="card-error">{currentCard.error}</small>}
+          {ocrProgress && <small className="field-hint">{ocrProgress}</small>}
 
-            {currentCard.showPrints && (
-              <div className="print-picker">
-                {currentCard.printOptions.map((option) => (
+          {!currentCard.selectedCard && currentCard.ocrCandidates.length > 0 && (
+            <div className="ocr-candidate-actions">
+              <span>Linhas reconhecidas</span>
+              <div>
+                {currentCard.ocrCandidates.slice(0, 6).map((candidate) => (
                   <button
                     type="button"
-                    key={option.id}
-                    className={currentCard.selectedCard?.id === option.id ? "selected" : ""}
-                    onClick={() => updateCurrentCard({
-                      selectedCard: option,
-                      cardName: option.name,
-                      showPrints: false
-                    })}
+                    key={candidate}
+                    onClick={() => void searchCurrentCard(candidate)}
                   >
-                    {option.imageUrl ? <img src={option.imageUrl} alt="" /> : <span>Sem imagem</span>}
-                    <small>{option.setCode.toUpperCase()} · #{option.collectorNumber}</small>
+                    {candidate}
                   </button>
                 ))}
               </div>
-            )}
-
-            {currentCard.error && <small className="card-error">{currentCard.error}</small>}
-
-            <div className="card-option-grid">
-              <label className="field field--compact">
-                <span>Condição</span>
-                <select
-                  value={currentCard.condition}
-                  onChange={(event) => updateCurrentCard({ condition: event.target.value as CardCondition })}
-                >
-                  {conditions.map((condition) => <option key={condition}>{condition}</option>)}
-                </select>
-              </label>
-              <label className="field field--compact">
-                <span>Acabamento</span>
-                <select
-                  value={currentCard.finish}
-                  onChange={(event) => updateCurrentCard({ finish: event.target.value as Finish })}
-                >
-                  {finishes.map((finish) => (
-                    <option key={finish.value} value={finish.value}>{finish.label}</option>
-                  ))}
-                </select>
-              </label>
-              <label className="field field--compact">
-                <span>Qtd.</span>
-                <input
-                  type="number"
-                  min="1"
-                  max="20"
-                  inputMode="numeric"
-                  value={currentCard.quantity}
-                  onChange={(event) => updateCurrentCard({
-                    quantity: Math.max(1, Math.min(20, Number(event.target.value) || 1))
-                  })}
-                />
-              </label>
-              <label className="field field--compact">
-                <span>Valor unitário</span>
-                <input
-                  inputMode="decimal"
-                  value={currentCard.priceText}
-                  onChange={(event) => updateCurrentCard({
-                    priceText: event.target.value.replace(/[^\d,.]/g, "")
-                  })}
-                  placeholder="0,00"
-                />
-              </label>
             </div>
+          )}
 
-            <a
-              className={`button button--compact liga-button ${currentCard.cardName.trim().length < 2 ? "disabled" : ""}`}
-              href={currentCard.cardName.trim().length >= 2 ? buildLigaMagicUrl(currentCard.cardName.trim()) : undefined}
-              target="_blank"
-              rel="noreferrer"
-              onClick={() => {
-                if (currentCard.cardName) {
-                  navigator.clipboard?.writeText(currentCard.cardName).catch(() => undefined);
+          {(debugEnabled || currentCard.rawOcrText) && (
+            <details className="ocr-debug-panel">
+              <summary>Ver diagnóstico da leitura</summary>
+              {currentCard.ocrAttempts.map((attempt, index) => (
+                <div key={`${attempt.source}_${index}`}>
+                  <strong>
+                    {attempt.source === "original" ? "Imagem original" : "Tentativa com contraste leve"}
+                    {attempt.confidence !== null ? ` · confiança ${Math.round(attempt.confidence)}%` : ""}
+                  </strong>
+                  <pre>{attempt.rawText || "Nenhum texto extraído."}</pre>
+                </div>
+              ))}
+            </details>
+          )}
+
+          {currentCard.selectedCard && (
+            <>
+              <div className="price-focus-card">
+                <a
+                  className="button liga-button"
+                  href={buildLigaMagicUrl(currentCard.cardName)}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={() => {
+                    awaitingPriceFocusRef.current = true;
+                    navigator.clipboard?.writeText(currentCard.cardName).catch(() => undefined);
+                  }}
+                >
+                  <ExternalLink size={17} /> Abrir na LigaMagic
+                </a>
+                <label className="field money-field">
+                  <span>Valor unitário</span>
+                  <input
+                    ref={priceInputRef}
+                    inputMode="decimal"
+                    value={currentCard.priceText}
+                    onChange={(event) => updateCurrentCard({
+                      priceText: event.target.value.replace(/[^\d,.]/g, "")
+                    })}
+                    placeholder="0,00"
+                  />
+                </label>
+              </div>
+
+              <details
+                className="secondary-settings"
+                open={currentCard.showOptions}
+                onToggle={(event) => updateCurrentCard({
+                  showOptions: (event.currentTarget as HTMLDetailsElement).open
+                })}
+              >
+                <summary>
+                  <Settings2 size={16} /> {currentCard.condition} · {finishes.find((item) => item.value === currentCard.finish)?.label} · {currentCard.quantity} unidade
+                </summary>
+                <div className="card-option-grid">
+                  <label className="field field--compact">
+                    <span>Condição</span>
+                    <select
+                      value={currentCard.condition}
+                      onChange={(event) => updateCurrentCard({ condition: event.target.value as CardCondition })}
+                    >
+                      {conditions.map((condition) => <option key={condition}>{condition}</option>)}
+                    </select>
+                  </label>
+                  <label className="field field--compact">
+                    <span>Acabamento</span>
+                    <select
+                      value={currentCard.finish}
+                      onChange={(event) => updateCurrentCard({ finish: event.target.value as Finish })}
+                    >
+                      {finishes.map((finish) => (
+                        <option key={finish.value} value={finish.value}>{finish.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field field--compact">
+                    <span>Quantidade</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="20"
+                      inputMode="numeric"
+                      value={currentCard.quantity}
+                      onChange={(event) => updateCurrentCard({
+                        quantity: Math.max(1, Math.min(20, Number(event.target.value) || 1))
+                      })}
+                    />
+                  </label>
+                </div>
+              </details>
+
+              <button
+                type="button"
+                className="button button--primary button--full scanner-next-button"
+                disabled={currentPriceCents < 0}
+                onClick={confirmAndNext}
+              >
+                <Check size={18} />
+                {currentPriceCents >= 0
+                  ? `Confirmar ${formatMoney(currentPriceCents * currentCard.quantity)} e ler próxima`
+                  : "Informe o preço para continuar"
                 }
-              }}
-            >
-              <ExternalLink size={16} /> Abrir na LigaMagic
-            </a>
+              </button>
+            </>
+          )}
+
+          {!currentCard.selectedCard && (
+            <div className="unresolved-actions">
+              <button className="button" onClick={() => void analyzePhoto(currentCard.photoDataUrl!)}>
+                <RefreshCw size={17} /> Tentar leitura novamente
+              </button>
+              <button className="button" onClick={deferCurrentCard}>
+                Deixar pendente e continuar
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
+      {reviewOpen && (
+        <section className="scanner-review-panel">
+          <div className="scanner-title-row">
+            <div>
+              <span className="eyebrow">Lote</span>
+              <h2>Revise antes de finalizar</h2>
+            </div>
+            <button className="text-button" onClick={() => setReviewOpen(false)}>Fechar</button>
           </div>
-        </article>
 
-        <button
-          type="button"
-          className="button button--primary button--full"
-          disabled={!currentCard.photoDataUrl || !currentCard.selectedCard || parseMoneyToCents(currentCard.priceText) < 0}
-          onClick={confirmAndNext}
-        >
-          <Check size={18} /> Confirmar carta e fotografar próxima
-        </button>
-      </section>
+          {confirmedCards.length === 0 && pendingCards.length === 0 && (
+            <p className="card-help">Nenhuma carta adicionada ainda.</p>
+          )}
 
-      <section className="card-step">
-        <span className="eyebrow">4. Lote</span>
-        <h3>Cartas confirmadas</h3>
-
-        {confirmedCards.length === 0 ? (
-          <p className="card-help">Nenhuma carta confirmada ainda.</p>
-        ) : (
           <div className="confirmed-card-list">
             {confirmedCards.map((card, index) => {
               const unitPriceCents = parseMoneyToCents(card.priceText);
@@ -814,40 +1289,62 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
                   )}
                   <div>
                     <strong>{index + 1}. {card.selectedCard?.name ?? card.cardName}</strong>
-                    <small>
-                      {card.selectedCard?.setCode.toUpperCase()} · #{card.selectedCard?.collectorNumber} · {card.condition}
-                    </small>
+                    <small>{card.selectedCard?.setCode.toUpperCase()} · #{card.selectedCard?.collectorNumber} · {card.condition}</small>
                     <span>{card.quantity} × {formatMoney(unitPriceCents)}</span>
                   </div>
-                  <button
-                    type="button"
-                    className="icon-button icon-button--danger"
-                    aria-label={`Remover ${card.cardName}`}
-                    onClick={() => setConfirmedCards((current) => current.filter((item) => item.key !== card.key))}
-                  >
-                    <Trash2 size={16} />
-                  </button>
+                  <div className="review-item-actions">
+                    <button type="button" onClick={() => editConfirmed(card)}>Editar</button>
+                    <button
+                      type="button"
+                      aria-label={`Remover ${card.cardName}`}
+                      onClick={() => setConfirmedCards((current) => current.filter((item) => item.key !== card.key))}
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
                 </article>
               );
             })}
-          </div>
-        )}
-      </section>
 
-      <section className="card-order-total">
-        <div>
-          <span>{confirmedQuantity} cartas confirmadas</span>
+            {pendingCards.map((card, index) => (
+              <article className="confirmed-card confirmed-card--pending" key={card.key}>
+                {card.photoDataUrl ? <img src={card.photoDataUrl} alt="" /> : <div className="confirmed-card__empty" />}
+                <div>
+                  <strong>Pendente {index + 1}</strong>
+                  <small>{card.cardName || "Nome não identificado"}</small>
+                  <span>Precisa de revisão</span>
+                </div>
+                <div className="review-item-actions">
+                  <button type="button" onClick={() => reviewPending(card)}>Resolver</button>
+                  <button
+                    type="button"
+                    aria-label="Remover pendência"
+                    onClick={() => setPendingCards((current) => current.filter((item) => item.key !== card.key))}
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <footer className="scanner-sticky-footer">
+        <button type="button" className="scanner-lot-summary" onClick={() => setReviewOpen((current) => !current)}>
+          <span>{confirmedQuantity} cartas{pendingCards.length > 0 ? ` · ${pendingCards.length} pendentes` : ""}</span>
           <strong>{formatMoney(totalCents)}</strong>
-        </div>
+          <small>Ver lote</small>
+        </button>
         <button
           type="button"
           className="button button--primary"
-          disabled={busy || saving || confirmedCards.length === 0}
+          disabled={busy || saving || confirmedCards.length === 0 || pendingCards.length > 0}
           onClick={finalize}
         >
           {saving ? "Finalizando…" : "Finalizar lote"}
         </button>
-      </section>
+      </footer>
     </div>
   );
 }
