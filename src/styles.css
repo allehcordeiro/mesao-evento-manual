@@ -2649,3 +2649,112 @@ small {
   font-size: 0.72rem;
   line-height: 1.35;
 }
+
+
+/* Balcão V6 — captura manual fixa, OCR rápido e inclusão manual */
+.card-order-flow--camera-step {
+  padding-bottom: calc(13.5rem + env(safe-area-inset-bottom));
+}
+
+.reader-status {
+  flex: 0 0 auto;
+  padding: 0.42rem 0.58rem;
+  border-radius: 999px;
+  background: #f3eee6;
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.reader-status--ready {
+  background: var(--green-100);
+  color: var(--green-900);
+}
+
+.camera-secondary-actions {
+  display: flex;
+  justify-content: center;
+  min-height: 2rem;
+}
+
+.camera-secondary-actions .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.recognition-comparison--manual {
+  grid-template-columns: minmax(0, 240px);
+  justify-content: center;
+}
+
+.scanner-sticky-footer--capture {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.55rem;
+  padding: 0.62rem;
+}
+
+.scanner-capture-footer-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0 0.15rem;
+}
+
+.scanner-finish-compact {
+  min-height: 36px;
+  padding: 0.4rem 0.65rem;
+  border: 0;
+  border-radius: 0.7rem;
+  background: var(--green-100);
+  color: var(--green-900);
+  font-size: 0.7rem;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.scanner-finish-compact:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.scanner-fixed-capture-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.55rem;
+}
+
+.scanner-fixed-capture-button {
+  min-height: 58px;
+  font-size: 0.95rem;
+}
+
+.scanner-manual-button {
+  min-width: 108px;
+  min-height: 58px;
+}
+
+.drawer .scanner-sticky-footer--capture {
+  bottom: -1rem;
+}
+
+@media (max-width: 430px) {
+  .card-order-flow--camera-step {
+    padding-bottom: calc(14rem + env(safe-area-inset-bottom));
+  }
+
+  .scanner-fixed-capture-actions {
+    grid-template-columns: minmax(0, 1fr) 104px;
+  }
+
+  .scanner-manual-button {
+    min-width: 0;
+    padding-inline: 0.65rem;
+  }
+
+  .reader-status {
+    font-size: 0.6rem;
+  }
+}
