@@ -1814,3 +1814,55 @@ small {
   font-weight: 800;
   letter-spacing: 0.02em;
 }
+
+/* OCR de imagem completa — diagnóstico e seleção de linhas */
+.ocr-reading-details {
+  margin-top: 10px;
+  border: 1px solid var(--line, #ded6ca);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.56);
+  overflow: hidden;
+}
+
+.ocr-reading-details summary {
+  padding: 11px 13px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 800;
+  color: var(--ink, #17362b);
+}
+
+.ocr-reading-details pre {
+  margin: 0;
+  padding: 12px 13px;
+  max-height: 190px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-top: 1px solid var(--line, #ded6ca);
+  background: rgba(23, 54, 43, 0.045);
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.ocr-candidate-list {
+  display: grid;
+  gap: 6px;
+  padding: 0 12px 12px;
+}
+
+.ocr-candidate-list > span {
+  font-size: 0.72rem;
+  color: var(--muted, #6b756f);
+}
+
+.ocr-candidate-list button {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line, #ded6ca);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--ink, #17362b);
+  text-align: left;
+  font-weight: 700;
+}

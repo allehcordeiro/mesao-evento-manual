@@ -48,6 +48,7 @@ declare global {
 interface DraftCard {
   key: string;
   rawOcrText: string;
+  ocrCandidates: string[];
   cardName: string;
   selectedCard: ScryfallCardOption | null;
   printOptions: ScryfallCardOption[];
@@ -78,6 +79,7 @@ function createDraftCard(index: number): DraftCard {
   return {
     key: `${Date.now()}_${index}_${Math.random()}`,
     rawOcrText: "",
+    ocrCandidates: [],
     cardName: "",
     selectedCard: null,
     printOptions: [],
@@ -148,45 +150,69 @@ async function compressPhoto(file: File): Promise<string> {
   }
 }
 
-async function cropSingleCardTitle(photoDataUrl: string): Promise<string> {
+async function prepareFullCardForOcr(photoDataUrl: string): Promise<string> {
   const image = await loadImage(photoDataUrl);
 
-  // Como a captura é de uma única carta, a faixa superior pode ser ampliada
-  // agressivamente sem risco de misturar cartas vizinhas.
-  const sourceX = image.naturalWidth * 0.035;
-  const sourceY = image.naturalHeight * 0.025;
-  const sourceWidth = image.naturalWidth * 0.93;
-  const sourceHeight = image.naturalHeight * 0.22;
+  // O Tesseract recebe a carta inteira. A ordem natural da leitura (topo para
+  // baixo) é usada para considerar o título como o primeiro texto plausível.
+  const minimumWidth = 1500;
+  const scale = image.naturalWidth < minimumWidth
+    ? Math.min(2.4, minimumWidth / Math.max(1, image.naturalWidth))
+    : 1;
 
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(900, Math.round(sourceWidth * 2.2));
-  canvas.height = Math.max(180, Math.round(sourceHeight * 2.2));
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
   const context = canvas.getContext("2d");
-  if (!context) throw new Error("Não foi possível recortar a fotografia.");
+  if (!context) throw new Error("Não foi possível preparar a fotografia para leitura.");
 
-  context.filter = "grayscale(1) contrast(1.65) brightness(1.08)";
-  context.drawImage(
-    image,
-    sourceX,
-    sourceY,
-    sourceWidth,
-    sourceHeight,
-    0,
-    0,
-    canvas.width,
-    canvas.height
-  );
+  // Um tratamento moderado conserva tanto o título quanto os demais textos.
+  // Exagerar no contraste pode apagar letras claras ou textos de cartas antigas.
+  context.filter = "grayscale(1) contrast(1.28) brightness(1.04)";
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
 
-  return canvas.toDataURL("image/jpeg", 0.92);
+  return canvas.toDataURL("image/png");
 }
 
-function cleanOcrName(text: string): string {
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.replace(/[^A-Za-zÀ-ÿ0-9,'’\- ]/g, " ").replace(/\s+/g, " ").trim())
-    .filter((line) => /[A-Za-zÀ-ÿ]{2}/.test(line));
+function normalizeOcrLine(line: string): string {
+  return line
+    .replace(/^[\s>|»•*#~_]+/, "")
+    .replace(/^\d{1,3}\s*[).:\]\-]\s*/, "")
+    .replace(/[^A-Za-zÀ-ÿ0-9,'’\-:!?.&/ ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 100);
+}
 
-  return lines.sort((left, right) => right.length - left.length)[0]?.slice(0, 80) ?? "";
+function extractOcrCandidates(text: string): string[] {
+  const seen = new Set<string>();
+  const candidates: string[] = [];
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = normalizeOcrLine(rawLine);
+    if (line.length < 2 || !/[A-Za-zÀ-ÿ]{2}/.test(line)) continue;
+
+    const words = line.split(" ").filter(Boolean);
+    const oneCharacterWords = words.filter((word) => word.length === 1).length;
+    const letterCount = (line.match(/[A-Za-zÀ-ÿ]/g) ?? []).length;
+
+    // Descarta linhas que são predominantemente símbolos/letras isoladas, um
+    // padrão comum na leitura de ícones, custo de mana e moldura da carta.
+    if (words.length >= 3 && oneCharacterWords >= Math.ceil(words.length / 2)) continue;
+    if (letterCount < Math.max(2, Math.floor(line.length * 0.45))) continue;
+    if (/^(copyright|illustrated by|artist|collector|wizards of the coast)$/i.test(line)) continue;
+
+    const key = line.toLocaleLowerCase("en-US");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push(line);
+
+    // O título está no topo. Limitar as tentativas evita que um trecho longo das
+    // regras seja confundido com o nome de outra carta real.
+    if (candidates.length >= 8) break;
+  }
+
+  return candidates;
 }
 
 async function composeOrderPhoto(cards: DraftCard[]): Promise<string | null> {
@@ -288,6 +314,7 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
         ...current,
         photoDataUrl,
         rawOcrText: "",
+        ocrCandidates: [],
         cardName: "",
         selectedCard: null,
         printOptions: [],
@@ -371,7 +398,7 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
     setOcrProgress("Carregando o leitor de texto…");
     const worker = await window.Tesseract.createWorker("eng");
     await worker.setParameters({
-      tessedit_pageseg_mode: "7",
+      tessedit_pageseg_mode: "3",
       preserve_interword_spaces: "1"
     });
     ocrWorkerRef.current = worker;
@@ -389,24 +416,66 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
     updateCurrentCard({ error: "" });
     try {
       const worker = await getOcrWorker();
-      setOcrProgress("Lendo o nome da carta…");
-      const crop = await cropSingleCardTitle(currentCard.photoDataUrl);
-      const result = await worker.recognize(crop);
+      setOcrProgress("Lendo todos os textos da carta…");
+      const preparedImage = await prepareFullCardForOcr(currentCard.photoDataUrl);
+      const result = await worker.recognize(preparedImage);
       const rawText = result.data.text.trim();
-      const name = cleanOcrName(rawText);
+      const candidates = extractOcrCandidates(rawText);
+      const firstCandidate = candidates[0] ?? "";
+
       updateCurrentCard({
         rawOcrText: rawText,
-        cardName: name,
+        ocrCandidates: candidates,
+        cardName: firstCandidate,
         selectedCard: null,
-        error: name ? "" : "Não foi possível ler o nome. Digite manualmente."
+        printOptions: [],
+        showPrints: false,
+        error: firstCandidate ? "" : "Não foi possível localizar uma primeira linha legível. Digite o nome manualmente."
       });
 
-      if (name) {
-        setOcrProgress(`Nome lido: ${name}. Conferindo no Scryfall…`);
-        await searchCurrentCard(name);
-        setOcrProgress("Confira se a carta e a edição estão corretas.");
+      if (!firstCandidate) {
+        setOcrProgress("Não conseguimos ler uma linha utilizável. Digite o nome manualmente.");
+        return;
+      }
+
+      let matchedCard: ScryfallCardOption | null = null;
+      let matchedCandidate = "";
+
+      // A primeira linha é sempre tentada primeiro. As seguintes funcionam como
+      // contingência para casos em que o OCR produziu um pequeno ruído acima do título.
+      for (const candidate of candidates) {
+        setOcrProgress(`Conferindo “${candidate}” no Scryfall…`);
+        try {
+          matchedCard = await resolveScryfallCard(candidate);
+          matchedCandidate = candidate;
+          break;
+        } catch {
+          // Tenta a próxima linha plausível. O erro final é exibido abaixo.
+        }
+      }
+
+      if (matchedCard) {
+        updateCurrentCard({
+          rawOcrText: rawText,
+          ocrCandidates: candidates,
+          cardName: matchedCard.name,
+          selectedCard: matchedCard,
+          printOptions: [],
+          showPrints: false,
+          searching: false,
+          error: ""
+        });
+        setOcrProgress(`O OCR sugeriu “${matchedCandidate}”. Confirme a carta e a edição.`);
       } else {
-        setOcrProgress("Não conseguimos ler o nome. Digite-o manualmente.");
+        updateCurrentCard({
+          rawOcrText: rawText,
+          ocrCandidates: candidates,
+          cardName: firstCandidate,
+          selectedCard: null,
+          searching: false,
+          error: "O Scryfall não reconheceu as primeiras linhas. Corrija o nome ou escolha outro candidato abaixo."
+        });
+        setOcrProgress(`Primeira linha lida: ${firstCandidate}.`);
       }
     } catch (caught) {
       setError(
@@ -559,6 +628,30 @@ export function CardOrderFlow({ tabId, busy, onCompleted }: CardOrderFlowProps) 
           {ocrRunning ? "Lendo nome…" : "Ler nome da carta"}
         </button>
         {ocrProgress && <small className="field-hint">{ocrProgress}</small>}
+
+        {currentCard.rawOcrText && (
+          <details className="ocr-reading-details">
+            <summary>Ver leitura completa do OCR</summary>
+            {currentCard.ocrCandidates.length > 0 && (
+              <div className="ocr-candidate-list">
+                <span>Linhas testadas, na ordem:</span>
+                {currentCard.ocrCandidates.map((candidate, index) => (
+                  <button
+                    type="button"
+                    key={`${candidate}_${index}`}
+                    onClick={() => {
+                      updateCurrentCard({ cardName: candidate, selectedCard: null, error: "" });
+                      void searchCurrentCard(candidate);
+                    }}
+                  >
+                    {index + 1}. {candidate}
+                  </button>
+                ))}
+              </div>
+            )}
+            <pre>{currentCard.rawOcrText}</pre>
+          </details>
+        )}
       </section>
 
       <section className="card-step">
