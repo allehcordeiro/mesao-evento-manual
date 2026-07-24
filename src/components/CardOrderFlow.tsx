@@ -1048,7 +1048,7 @@ export function CardOrderFlow({
       <div className={containerClass}>
         {error && <div className="inline-error">{error}</div>}
         <section className="card-setup-card">
-          <div className="scanner-version">Scanner de balcão · versão 6.1</div>
+          <div className="scanner-version">Scanner de balcão · versão 6.2</div>
           <span className="eyebrow">Venda de cartas</span>
           <h2>Prepare o atendimento</h2>
           <p>
@@ -1115,7 +1115,7 @@ export function CardOrderFlow({
     <div className={containerClass}>
       <header className="scanner-context-bar">
         <div>
-          <small>Scanner de balcão · PaddleOCR v6.1</small>
+          <small>Scanner de balcão · PaddleOCR v6.2</small>
           <span>{tabLabel ?? "Comanda selecionada"}</span>
           <strong>{selectedFolder?.name ?? "Pasta"}</strong>
         </div>

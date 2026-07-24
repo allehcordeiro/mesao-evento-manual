@@ -137,6 +137,44 @@ function now(): string {
   return new Date().toISOString();
 }
 
+async function tableColumnNames(
+  db: D1Database,
+  table: "card_folders" | "card_orders" | "card_order_items" | "tab_items"
+): Promise<Set<string>> {
+  const result = await db
+    .prepare(`PRAGMA table_info(${table})`)
+    .all<Record<string, unknown>>();
+  return new Set(result.results.map((column) => String(column.name)));
+}
+
+async function ensureTabItemsCardOrderColumn(db: D1Database): Promise<void> {
+  const currentColumns = await tableColumnNames(db, "tab_items");
+  if (currentColumns.has("card_order_id")) return;
+
+  try {
+    await db
+      .prepare(
+        `ALTER TABLE tab_items
+         ADD COLUMN card_order_id TEXT
+         REFERENCES card_orders(id) ON DELETE SET NULL`
+      )
+      .run();
+  } catch (error) {
+    // Dois atendimentos podem detectar a coluna ausente ao mesmo tempo.
+    // Revalida o schema antes de considerar a alteração como falha real.
+    const refreshedColumns = await tableColumnNames(db, "tab_items");
+    if (!refreshedColumns.has("card_order_id")) throw error;
+  }
+
+  await db
+    .prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_tab_items_card_order_unique
+       ON tab_items(card_order_id)
+       WHERE card_order_id IS NOT NULL`
+    )
+    .run();
+}
+
 function scryfallImageUrl(card: Record<string, unknown>): string | null {
   const imageUris = card.image_uris as Record<string, unknown> | undefined;
   if (imageUris?.normal) return String(imageUris.normal);
@@ -418,6 +456,19 @@ async function getTabDetail(db: D1Database, tabId: string) {
 
   if (!row) throw new HttpError(404, "Comanda não encontrada.");
 
+  const tabItemColumns = await tableColumnNames(db, "tab_items");
+  const hasCardOrderLink = tabItemColumns.has("card_order_id");
+  const cardOrderSelect = hasCardOrderLink
+    ? `ti.card_order_id,
+       co.card_count,
+       co.folder_name_snapshot AS card_folder_name`
+    : `NULL AS card_order_id,
+       NULL AS card_count,
+       NULL AS card_folder_name`;
+  const cardOrderJoin = hasCardOrderLink
+    ? "LEFT JOIN card_orders co ON co.id = ti.card_order_id"
+    : "";
+
   const items = await db
     .prepare(
       `SELECT
@@ -429,11 +480,9 @@ async function getTabDetail(db: D1Database, tabId: string) {
          ti.total_price_cents,
          ti.preparation_status,
          ti.created_at,
-         ti.card_order_id,
-         co.card_count,
-         co.folder_name_snapshot AS card_folder_name
+         ${cardOrderSelect}
        FROM tab_items ti
-       LEFT JOIN card_orders co ON co.id = ti.card_order_id
+       ${cardOrderJoin}
        WHERE ti.tab_id = ?
        ORDER BY ti.created_at DESC`
     )
@@ -959,13 +1008,38 @@ async function handleCardFolders(request: Request, env: Env): Promise<Response> 
   const folderId = id("folder");
   const timestamp = now();
 
+  const availableColumns = await tableColumnNames(env.DB, "card_folders");
+  const insertColumns = ["id", "code", "name"];
+  const insertValues: unknown[] = [folderId, code, name];
+
+  if (availableColumns.has("qr_token")) {
+    insertColumns.push("qr_token");
+    insertValues.push(`folder_${crypto.randomUUID()}`);
+  }
+
+  insertColumns.push("active", "sort_order");
+  insertValues.push(1, Number(count?.total ?? 0) + 1);
+
+  if (availableColumns.has("created_by_operator_id")) {
+    insertColumns.push("created_by_operator_id");
+    insertValues.push("operator");
+  }
+
+  if (availableColumns.has("updated_by_operator_id")) {
+    insertColumns.push("updated_by_operator_id");
+    insertValues.push("operator");
+  }
+
+  insertColumns.push("created_at", "updated_at");
+  insertValues.push(timestamp, timestamp);
+
+  const placeholders = insertColumns.map(() => "?").join(", ");
   await env.DB
     .prepare(
-      `INSERT INTO card_folders
-        (id, code, name, active, sort_order, created_at, updated_at)
-       VALUES (?, ?, ?, 1, ?, ?, ?)`
+      `INSERT INTO card_folders (${insertColumns.join(", ")})
+       VALUES (${placeholders})`
     )
-    .bind(folderId, code, name, Number(count?.total ?? 0) + 1, timestamp, timestamp)
+    .bind(...insertValues)
     .run();
 
   return json({ id: folderId, code, name }, 201);
@@ -1113,62 +1187,128 @@ async function handleCreateCardOrder(
     ? new Date(Date.now() + CARD_PHOTO_RETENTION_DAYS * 86_400_000).toISOString()
     : null;
 
+  await ensureTabItemsCardOrderColumn(env.DB);
+
+  const orderTableColumns = await tableColumnNames(env.DB, "card_orders");
+  const orderColumns: string[] = [
+    "id",
+    "tab_id",
+    "folder_id",
+    "folder_code_snapshot",
+    "folder_name_snapshot",
+    "status",
+    "card_count",
+    "total_cents"
+  ];
+  const orderValues: unknown[] = [
+    orderId,
+    tabId,
+    folderId,
+    String(folder.code),
+    String(folder.name),
+    "completed",
+    cardCount,
+    totalCents
+  ];
+
+  const addOrderColumn = (column: string, value: unknown) => {
+    if (orderTableColumns.has(column)) {
+      orderColumns.push(column);
+      orderValues.push(value);
+    }
+  };
+
+  addOrderColumn("event_id", String(tab.event_id));
+  addOrderColumn("subtotal_cents", totalCents);
+  addOrderColumn("discount_cents", 0);
+  addOrderColumn("photo_data_url", photoDataUrl);
+  addOrderColumn("photo_size_bytes", photoSizeBytes);
+  addOrderColumn("photo_expires_at", expiresAt);
+  addOrderColumn("created_by_operator_id", "operator");
+  addOrderColumn("completed_by_operator_id", "operator");
+  addOrderColumn("completed_at", timestamp);
+  orderColumns.push("created_at", "updated_at");
+  orderValues.push(timestamp, timestamp);
+
+  const orderPlaceholders = orderColumns.map(() => "?").join(", ");
   const statements = [
     env.DB
       .prepare(
-        `INSERT INTO card_orders
-          (id, tab_id, folder_id, folder_code_snapshot, folder_name_snapshot,
-           status, card_count, total_cents, photo_data_url, photo_size_bytes,
-           photo_expires_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO card_orders (${orderColumns.join(", ")})
+         VALUES (${orderPlaceholders})`
       )
-      .bind(
-        orderId,
-        tabId,
-        folderId,
-        String(folder.code),
-        String(folder.name),
-        cardCount,
-        totalCents,
-        photoDataUrl,
-        photoSizeBytes,
-        expiresAt,
-        timestamp,
-        timestamp
-      )
+      .bind(...orderValues)
   ];
 
+  const itemTableColumns = await tableColumnNames(env.DB, "card_order_items");
   for (const item of items) {
+    const itemColumns: string[] = [
+      "id",
+      "card_order_id",
+      "sequence",
+      "raw_ocr_text",
+      "scryfall_id",
+      "card_name",
+      "set_code",
+      "set_name",
+      "collector_number",
+      "language",
+      "finish",
+      "card_condition",
+      "quantity",
+      "unit_price_cents",
+      "total_price_cents"
+    ];
+    const itemValues: unknown[] = [
+      id("card_item"),
+      orderId,
+      item.sequence,
+      item.rawOcrText,
+      item.scryfallId,
+      item.cardName,
+      item.setCode,
+      item.setName,
+      item.collectorNumber,
+      item.language,
+      item.finish,
+      item.condition,
+      item.quantity,
+      item.unitPriceCents,
+      item.totalPriceCents
+    ];
+
+    if (itemTableColumns.has("image_url")) {
+      itemColumns.push("image_url");
+      itemValues.push(item.imageUrl);
+    } else if (itemTableColumns.has("scryfall_image_url")) {
+      itemColumns.push("scryfall_image_url");
+      itemValues.push(item.imageUrl);
+    }
+
+    const addItemColumn = (column: string, value: unknown) => {
+      if (itemTableColumns.has(column)) {
+        itemColumns.push(column);
+        itemValues.push(value);
+      }
+    };
+
+    addItemColumn("recognition_status", "confirmed");
+    addItemColumn("price_source", "ligamagic_manual");
+    addItemColumn("priced_at", timestamp);
+    addItemColumn("priced_by_operator_id", "operator");
+    addItemColumn("confirmed_at", timestamp);
+    addItemColumn("confirmed_by_operator_id", "operator");
+    itemColumns.push("created_at", "updated_at");
+    itemValues.push(timestamp, timestamp);
+
+    const itemPlaceholders = itemColumns.map(() => "?").join(", ");
     statements.push(
       env.DB
         .prepare(
-          `INSERT INTO card_order_items
-            (id, card_order_id, sequence, raw_ocr_text, scryfall_id, card_name,
-             set_code, set_name, collector_number, language, finish,
-             card_condition, image_url, quantity, unit_price_cents,
-             total_price_cents, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO card_order_items (${itemColumns.join(", ")})
+           VALUES (${itemPlaceholders})`
         )
-        .bind(
-          id("card_item"),
-          orderId,
-          item.sequence,
-          item.rawOcrText,
-          item.scryfallId,
-          item.cardName,
-          item.setCode,
-          item.setName,
-          item.collectorNumber,
-          item.language,
-          item.finish,
-          item.condition,
-          item.imageUrl,
-          item.quantity,
-          item.unitPriceCents,
-          item.totalPriceCents,
-          timestamp,
-          timestamp
-        )
+        .bind(...itemValues)
     );
   }
 
@@ -1202,7 +1342,46 @@ async function handleCreateCardOrder(
       .bind(timestamp, tabId)
   );
 
-  await env.DB.batch(statements);
+  try {
+    await env.DB.batch(statements);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("card_order_finalize_failed", {
+      tabId,
+      folderId,
+      cardCount,
+      totalCents,
+      message
+    });
+
+    if (/foreign key constraint failed/i.test(message)) {
+      throw new HttpError(
+        409,
+        "Não foi possível vincular o lote à comanda. Atualize a página e confirme se a pasta e o produto Cartas avulsas continuam ativos."
+      );
+    }
+
+    const requiredColumn = message.match(/not null constraint failed:\s*([a-zA-Z0-9_.]+)/i)?.[1];
+    if (requiredColumn) {
+      throw new HttpError(
+        409,
+        `O banco exige o campo ${requiredColumn} para finalizar o lote. Consulte os logs do Worker antes de tentar novamente.`
+      );
+    }
+
+    const missingColumn =
+      message.match(/no such column:\s*([a-zA-Z0-9_.]+)/i)?.[1] ??
+      message.match(/has no column named\s+([a-zA-Z0-9_.]+)/i)?.[1];
+    if (missingColumn) {
+      throw new HttpError(
+        409,
+        `O banco não possui o campo ${missingColumn}. Publique a versão 6.2 e tente novamente.`
+      );
+    }
+
+    throw error;
+  }
+
   return json(await getTabDetail(env.DB, tabId), 201);
 }
 
@@ -1221,11 +1400,18 @@ async function handleGetCardOrder(env: Env, cardOrderId: string): Promise<Respon
 
   if (!order) throw new HttpError(404, "Pedido de cartas não encontrado.");
 
+  const itemTableColumns = await tableColumnNames(env.DB, "card_order_items");
+  const imageExpression = itemTableColumns.has("image_url")
+    ? "image_url"
+    : itemTableColumns.has("scryfall_image_url")
+      ? "scryfall_image_url AS image_url"
+      : "NULL AS image_url";
+
   const result = await env.DB
     .prepare(
       `SELECT id, sequence, raw_ocr_text, scryfall_id, card_name, set_code,
               set_name, collector_number, language, finish, card_condition,
-              image_url, quantity, unit_price_cents, total_price_cents
+              ${imageExpression}, quantity, unit_price_cents, total_price_cents
        FROM card_order_items
        WHERE card_order_id = ?
        ORDER BY sequence`
